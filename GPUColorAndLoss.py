@@ -8,7 +8,7 @@ class GPUColorAndLoss:
     """
 
     @staticmethod
-    @torch.compile( )
+    @torch.compile(fullgraph=True)
     def compute_optimal_color(target_tile: torch.Tensor, canvas_tile: torch.Tensor,
                               mask: torch.Tensor, alpha: torch.Tensor,
                               target_alpha_tile: torch.Tensor) -> torch.Tensor:
@@ -33,7 +33,7 @@ class GPUColorAndLoss:
         return color
 
     @staticmethod
-    @torch.compile( )
+    @torch.compile(fullgraph=True)
     def blend_shape(canvas_tile: torch.Tensor, color: torch.Tensor,
                     mask: torch.Tensor, alpha: torch.Tensor) -> torch.Tensor:
         """
@@ -46,7 +46,7 @@ class GPUColorAndLoss:
         return eff_c * color_c + (1.0 - eff_c) * canvas_tile
 
     @staticmethod
-    @torch.compile( )
+    @torch.compile(fullgraph=True)
     def compute_score(blended_tile, target_tile, target_alpha_tile, canvas_tile, mask, alpha, params):
         B = mask.shape[0]
 
