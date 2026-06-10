@@ -157,7 +157,7 @@ class OptimizerEngine:
 
             with torch.no_grad():
                 for gen in range(1, n_generations + 1):
-                    progress = 1.0 - (gen - 1) / n_generations
+                    progress = torch.tensor(1.0 - (gen - 1) / n_generations, device=device)
 
                     # Wir feuern den komplett durchkompilierten Kernel ab!
                     elites = OptimizerEngine._evolution_step(
@@ -246,7 +246,7 @@ class OptimizerEngine:
 
     @staticmethod
     @torch.compile(fullgraph=True)
-    def _evolution_step(elites: torch.Tensor, progress: float, resolution: int,
+    def _evolution_step(elites: torch.Tensor, progress: torch.Tensor, resolution: int,
                         min_size: float, max_size: float, shape_type: int,
                         T_target_k: torch.Tensor, T_canvas_k: torch.Tensor,
                         T_alpha_k: torch.Tensor, local_grids_k: torch.Tensor) -> torch.Tensor:
