@@ -54,6 +54,7 @@ class GPUShapes:
         return x_rot, y_rot
 
     @staticmethod
+    @torch.compile
     def sdf_ellipse(grid: torch.Tensor, params: torch.Tensor) -> torch.Tensor:
         """
         Algebraische SDF für eine Ellipse.
@@ -74,6 +75,7 @@ class GPUShapes:
         return (x_rot / rx_v) ** 2 + (y_rot / ry_v) ** 2 - 1.0
 
     @staticmethod
+    @torch.compile
     def sdf_rectangle(grid: torch.Tensor, params: torch.Tensor) -> torch.Tensor:
         """
         Exakte euklidische SDF für ein Rechteck (Inigo Quilez Methode).

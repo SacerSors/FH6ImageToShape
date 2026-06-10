@@ -1,10 +1,14 @@
+import time
+
 import torch
 import torchvision.transforms.functional as TF
-from PIL import Image
+from PIL import Image, ImageFilter
 import json
 import math
 import cv2
 import numpy as np
+from sympy import true
+from sympy.functions.elementary.integers import ceiling
 
 from OptimizerEngine import OptimizerEngine
 from GPUColorAndLoss import GPUColorAndLoss
@@ -22,18 +26,43 @@ class VectorRenderer:
         self.vector_data = []
 
         # Wir berechnen die Hintergrundfarbe einmal am Anfang
-        temp_img = self._load_target_image(64)
-        self.mean_color = temp_img.mean(dim=(1, 2), keepdim=True)
+        temp_img = self._load_target_image(128)
+
+        # 1. Pixel flachklopfen und in 0-255 Ganzzahlen (Long) umwandeln
+        # Form: von (3, 64, 64) -> (4096, 3) | Jede Zeile ist ein [R, G, B] Pixel
+        pixels = (temp_img.permute(1, 2, 0) * 255).long().view(-1, 3)
+
+        # 2. Bit-Packing: Wir codieren R, G, B in eine einzige, eindeutige Zahl
+        # R * 256^2 + G * 256 + B. Das macht aus der 3D-Farbe einen einfachen 1D-Wert.
+        encoded_pixels = pixels[:, 0] * 65536 + pixels[:, 1] * 256 + pixels[:, 2]
+
+        # 3. Zähle, welche codierte Farbe am häufigsten im Bild vorkommt
+        unique_colors, counts = torch.unique(encoded_pixels, return_counts=True)
+        dominant_color_idx = torch.argmax(counts)
+        winner_encoded = unique_colors[dominant_color_idx]
+
+        # 4. Die Gewinner-Zahl wieder zurück in R, G, B decodieren und auf 0.0-1.0 normalisieren
+        r = (winner_encoded // 65536).float() / 255.0
+        g = ((winner_encoded % 65536) // 256).float() / 255.0
+        b = (winner_encoded % 256).float() / 255.0
+
+        # 5. Als (3, 1, 1) Tensor speichern, damit expand_as() im Loop perfekt matcht
+        self.mean_color = torch.tensor([r, g, b], device=self.device).view(3, 1, 1)
 
         # Aktuelle Arbeitsvariablen (werden pro LOD überschrieben)
         self.resolution = 0
         self.target_img = None
         self.canvas_img = None
 
-    def _load_target_image(self, resolution):
-        """Lädt das Bild frisch von der Festplatte in der gewünschten Auflösung."""
+    def _load_target_image(self, resolution, blur_radius=0):
+        """Lädt das Bild und verschmiert es (blinzeln) für grobe LODs!"""
         img = Image.open(self.image_path).convert('RGB')
         img = img.resize((resolution, resolution), Image.Resampling.LANCZOS)
+
+        # NEU: Der Blinzel-Trick
+        if blur_radius > 0:
+            img = img.filter(ImageFilter.GaussianBlur(blur_radius))
+
         return TF.to_tensor(img).to(self.device)
 
     def _redraw_all_shapes(self):
@@ -56,29 +85,37 @@ class VectorRenderer:
             self._update_canvas(params, color, shape_type)
 
     # Füge die Pinselgrößen (min_brush_px, max_brush_px) als Argumente hinzu
-    def render(self, preview_interval=10, min_brush_px=5.0, max_brush_px=50.0):
-        # Unser Masterplan: Nur noch Auflösung und Anzahl der Formen!
+    def render(self, preview_interval=10, min_brush_px=5.0,
+               max_brush_px=50.0, total_shapes_target=2000, smart = False):
+        # Unser Masterplan: Nur noch Auflösung und Pinselgröße!
+        # Das Budget von 2000 Formen teilt sich das Skript jetzt komplett selbstständig ein.
         lods = [
-            {"name": "LOD 1 (Grob)", "res": 128, "shapes": 300, "brush_px": 80.0},  # Malt dicke Farbblöcke
-            {"name": "LOD 2 (Mittel)", "res": 256, "shapes": 500, "brush_px": 30.0},  # Definiert Schattierungen
-            {"name": "LOD 3 (Fein)", "res": 1024, "shapes": 700, "brush_px": 15.0},  # Zeichnet harte Kanten
-            {"name": "LOD 4 (Makro)", "res": 2000, "shapes": 200, "brush_px": 10.0},
-            {"name": "LOD 5 (Super-Makro)", "res": 4000, "shapes": 200, "brush_px": 10.0}
+            # LOD 1 "blinzelt" extrem stark (Blur 5). Es gibt keine Augen/Kanten mehr, nur Farbflächen!
+            {"name": "LOD 1 (Grob)", "res": 128, "brush_px": 60.0, "blur": 5,"q_limit": -20},
+            {"name": "LOD 2 (Mittel)", "res": 256, "brush_px": 60.0, "blur": 2,"q_limit": -30},
+            # Ab hier gestochen scharf für die Details
+            {"name": "LOD 3 (Fein)", "res": 1024, "brush_px": 60.0, "blur": 0,"q_limit": -60},
+            {"name": "LOD 4 (Makro)", "res": 2000, "brush_px": 60.0, "blur": 0,"q_limit": -100},
+            {"name": "LOD 4 (Makro)", "res": 4000, "brush_px": 60.0, "blur": 0,"q_limit": -50}
         ]
 
-        print(f"🚀 Starte echtes Multi-Scale Rendering auf {self.device}")
-        print(f"🎨 Feste Pinselgröße: {min_brush_px}px bis {max_brush_px}px\n")
+        print(f"🚀 Starte dynamisches Multi-Scale Rendering auf {self.device}")
+        print(f"🎯 Ziel-Budget: {total_shapes_target} Formen insgesamt")
+        print(f"🎨 Pinselgröße: {min_brush_px}px bis {max_brush_px}px\n")
 
-        MAX_BAD_SCORS = 25
+        MAX_BAD_SCORES = 50  # Nach 100 Fehlversuchen in Folge wird das LOD gewechselt
+        global_shapes_drawn = 0  # Unser globaler Meister-Zähler
+
         for lod_idx, lod in enumerate(lods):
-            bad_cores_pro_LOD = 0
+            consecutive_bad_scores = 0  # Zählt die Fehlversuche für das AKTUELLE LOD
+
             print(f"{'=' * 50}")
             print(f"🌟 WECHSEL ZU {lod['name']} | Auflösung: {lod['res']}x{lod['res']}")
             print(f"{'=' * 50}\n")
-
+            best_score_limit = lod["q_limit"]
             # 1. Canvas und Target für diese Stufe vorbereiten
             self.resolution = lod['res']
-            self.target_img = self._load_target_image(self.resolution)
+            self.target_img = self._load_target_image(self.resolution,blur_radius=lod["blur"])
             self.canvas_img = self.mean_color.expand_as(self.target_img).clone()
 
             # 2. Alte Formen in neuer Schärfe neu zeichnen
@@ -87,65 +124,102 @@ class VectorRenderer:
                 self._redraw_all_shapes()
 
             # --- DIE PINSEL-MATHEMATIK ---
-            # Wir berechnen die relative Größe (0.0 bis 1.0) für DIESE Auflösung
-
             current_max_s = lod["brush_px"] / self.resolution
-            current_min_s = current_max_s / 4
+            current_min_s = current_max_s / 10
             print(f"Relative Pinselgröße für dieses LOD: {current_min_s:.3f} bis {current_max_s:.3f}\n")
 
-            # 3. Der eigentliche Optimierungs-Loop für diese LOD
-            for step in range(lod['shapes']):
-                shape_type = 0 if step % 10 < 5 else 0
+            ideal_tile = (lod["brush_px"] * 2.0) + 48.0
 
-                # Aufmerksamkeitskarte (Error Map)
-                self.error_map = torch.mean(torch.abs(self.target_img - self.canvas_img), dim=0)
-                self.target_alpha = (self.error_map > 0.008).float()
+            # Für die GPU runden wir das auf das nächste Vielfache von 16 auf (Tensor-Core-Optimierung!)
+            current_tile_size = int(math.ceil(ideal_tile / 16.0) * 16)
+
+            # Minimal 64, damit die GPU nicht unterfordert ist
+            current_tile_size = max(64, current_tile_size)
+            print(f"TileSize: {current_tile_size}")
+
+            # 3. Der eigentliche Optimierungs-Loop
+            # Er läuft so lange, bis unser globales Budget leer ist ODER dieses LOD ausgereizt ist.
+            self.target_alpha = torch.ones(self.resolution, self.resolution, device=self.device)
+            while global_shapes_drawn < total_shapes_target:
+
+                # Form-Typ basierend auf dem globalen Zähler
+                shape_type = 0 if global_shapes_drawn % 20 < 10 else 2
+                # Aufmerksamkeitskarte (Fehlermaske = Nur das blanke Canvas)
+
+                if smart:
 
                 # Engine abfeuern
-                best_params, best_color, best_score = OptimizerEngine.find_best_shape(
-                    self.target_img, self.canvas_img, self.target_alpha,
-                    shape_type=shape_type,
-                    n_samples=8000,
-                    n_mutate=40,
-                    min_size=current_min_s,  # <-- Die dynamisch berechnete Grenze
-                    max_size=current_max_s  # <-- Die dynamisch berechnete Grenze
-                )
+                    best_params, best_color, best_score = OptimizerEngine.find_best_shape(
+                        self.target_img, self.canvas_img, self.target_alpha,
+                        shape_type=shape_type,
+                        n_samples=1024 * 40,
+                        n_mutate=86,
+                        min_size=current_min_s,
+                        max_size=current_max_s,
+                        chunk_size=2048,
+                        tile_size=current_tile_size,
+                        top_k=128
+                    )
 
-                # Filter schlechte scores
+                else:
+                    best_params, best_color, best_score = OptimizerEngine.find_best_shape(
+                        self.target_img, self.canvas_img, self.target_alpha,
+                        shape_type=shape_type,
+                        n_samples=1024 * 40,
+                        n_mutate=86,
+                        min_size=current_min_s,
+                        max_size=current_max_s,
+                        chunk_size=2048,
+                        tile_size=current_tile_size,
+                        top_k=128,
+                        optimizer_mode="dumb"
+                    )
 
-                if best_score > -0.5:
-                    bad_cores_pro_LOD +=1
-                    if best_score >=0:
-                        print(f"Form mit score{best_score} gefiltert. Bereits {bad_cores_pro_LOD} schlechte Shapes gefiltert")
-                        if bad_cores_pro_LOD >= MAX_BAD_SCORS:
-                            break
-                        continue
 
+                # --- DER FILTER LOGIK-BLOCK ---
+                if best_score >= best_score_limit:
+                    consecutive_bad_scores += 1
+
+                    print(f"{consecutive_bad_scores} Bad scores wurden gefunden.")
+
+                    # Wenn wir 100 Mal in Folge nichts Gutes mehr gefunden haben -> Break!
+                    if consecutive_bad_scores >= MAX_BAD_SCORES:
+                        print(f"\n🛑 LOD {lod['name']} ausgereizt! ({MAX_BAD_SCORES} Fehlversuche in Folge).")
+                        print(f"➡️  Wechsle zum nächsten LOD...\n")
+                        break  # Bricht die 'while'-Schleife ab und springt im 'for' zum nächsten LOD
+
+                    continue  # Bricht nur diesen Durchlauf ab. Wir versuchen es sofort nochmal!
+
+                # --- WENN WIR HIER SIND, WAR DIE FORM EIN ERFOLG! ---
+                consecutive_bad_scores = ceiling(consecutive_bad_scores/2)  # Reset! Wir haben einen Treffer gelandet.
+                global_shapes_drawn += 1  # Budget um 1 verringern
 
                 # Einbrennen & Speichern
                 self._update_canvas(best_params, best_color, shape_type)
                 self._save_to_memory(best_params, best_color, shape_type)
 
                 # OpenCV Live Vorschau
-                if (step + 1) % preview_interval == 0 or step == 0:
-                    self._show_preview(lod['name'], step + 1, lod['shapes'], best_score, shape_type)
+                if global_shapes_drawn % preview_interval == 0 or global_shapes_drawn == 1:
+                    self._show_preview(lod['name'], global_shapes_drawn, total_shapes_target, best_score, shape_type)
+
+            # Wenn wir hier ankommen und das Budget voll ist, brechen wir auch die äußere (LOD) Schleife ab!
+            if global_shapes_drawn >= total_shapes_target:
+                print(f"\n🎉 Globales Ziel-Budget von {total_shapes_target} Formen erreicht! Beende Rendering.")
+                break
 
         cv2.destroyAllWindows()
 
     def _show_preview(self, phase_name, step, total_shapes, best_score, shape_type):
         """Kapselt die OpenCV Logik sicher ein."""
-        np_img = (self.target_alpha.cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
-        bgr_img = cv2.cvtColor(np_img, cv2.COLOR_RGB2BGR)
 
         np_img_2 = (self.canvas_img.permute(1, 2, 0).cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
         bgr_img_2 = cv2.cvtColor(np_img_2, cv2.COLOR_RGB2BGR)
 
         # Egal wie groß das Bild intern ist (selbst bei 2048x2048),
         # wir zeigen das Vorschau-Fenster immer angenehm in 512x512 an!
-        display_img = cv2.resize(bgr_img, (512, 512), interpolation=cv2.INTER_AREA)
         display_img_2 = cv2.resize(bgr_img_2, (512, 512), interpolation=cv2.INTER_AREA)
 
-        cv2.imshow("Vector Renderer - Live Preview", display_img)
+
         cv2.imshow("Vector Renderer - Live Preview_2", display_img_2)
         cv2.waitKey(1)
 
@@ -201,6 +275,8 @@ if __name__ == "__main__":
     renderer = VectorRenderer(IMAGE_PATH)
 
     # 10er Intervalle für das Live-Fenster sind angenehm flüssig
-    renderer.render(preview_interval=1)
-
+    time_start = time.time()
+    renderer.render(preview_interval=10, total_shapes_target=3000, samrt=False)
+    time_end = time.time()
+    print(f"Dauer: {time_end - time_start}")
     renderer.export_results("frieren_vektor.json", "frieren_vektor.png")

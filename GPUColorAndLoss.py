@@ -8,36 +8,32 @@ class GPUColorAndLoss:
     """
 
     @staticmethod
+    @torch.compile( )
     def compute_optimal_color(target_tile: torch.Tensor, canvas_tile: torch.Tensor,
-                              mask: torch.Tensor, alpha: torch.Tensor
-                              ,target_alpha_tile: torch.Tensor) -> torch.Tensor:
-        """
-        Berechnet die analytisch perfekte (R,G,B) Farbe für B Formen gleichzeitig.
-        target_tile / canvas_tile Shape: (B, 3, H, W)
-        mask Shape: (B, H, W)
-        alpha Shape: (B,)
-        """
+                              mask: torch.Tensor, alpha: torch.Tensor,
+                              target_alpha_tile: torch.Tensor) -> torch.Tensor:
         B = mask.shape[0]
 
-        # 1. Effektive Deckkraft (SDF-Maske * Transparenz-Parameter)
-        eff = mask * alpha.view(B, 1, 1)  # Shape: (B, H, W)
+        eff = mask * alpha.view(B, 1, 1)
+        eff_c = eff.unsqueeze(1)
 
-        # 2. Die Kanal-Dimension hinzufügen, um mit RGB-Bildern zu rechnen
-        eff_c = eff.unsqueeze(1)  # Shape: (B, 1, H, W)
+        # Ränder außerhalb des echten Bildes ignorieren
         eff_c = eff_c * target_alpha_tile
-        # 3. Least Squares: Was fehlt noch auf der Leinwand, um das Ziel zu erreichen?
+
         residual = target_tile - (1.0 - eff_c) * canvas_tile
 
-        # 4. Zähler und Nenner über die Pixel (H, W) aufsummieren
-        num = torch.sum(eff_c * residual, dim=(2, 3))  # Shape: (B, 3)
-        den = torch.sum(eff_c ** 2, dim=(2, 3)) + 1e-5  # Shape: (B, 1)
+        num = torch.sum(eff_c * residual, dim=(2, 3))
+        den = torch.sum(eff_c ** 2, dim=(2, 3))
 
-        # 5. Farbe berechnen und auf gültige Werte [0.0, 1.0] begrenzen
-        color = torch.clamp(num / den, 0.0, 1.0)  # Shape: (B, 3)
+        # FIX: Clamp statt Addition! Verfälscht die Farben kleiner Formen nicht mehr ins Schwarze.
+        den = torch.clamp(den, min=1e-7)
+
+        color = torch.clamp(num / den, 0.0, 1.0)
 
         return color
 
     @staticmethod
+    @torch.compile( )
     def blend_shape(canvas_tile: torch.Tensor, color: torch.Tensor,
                     mask: torch.Tensor, alpha: torch.Tensor) -> torch.Tensor:
         """
@@ -50,34 +46,43 @@ class GPUColorAndLoss:
         return eff_c * color_c + (1.0 - eff_c) * canvas_tile
 
     @staticmethod
-    def compute_score(blended_tile, target_tile, target_alpha_tile, canvas_tile, mask, alpha,params):
+    @torch.compile( )
+    def compute_score(blended_tile, target_tile, target_alpha_tile, canvas_tile, mask, alpha, params):
         B = mask.shape[0]
 
-        # 1. Der Fehler der NEUEN Leinwand (mit Form)
+        # ==========================================================
+        # 1. KANTEN-LOSS (Dein bisheriger L2/MSE-Fehler)
+        # Super für messerscharfe Kanten und exakte Linien.
+        # ==========================================================
         new_mse = torch.mean((blended_tile - target_tile) ** 2, dim=1, keepdim=True)
-
-        # 2. Der Fehler der ALTEN Leinwand (ohne Form)
         old_mse = torch.mean((canvas_tile - target_tile) ** 2, dim=1, keepdim=True)
+        mse_delta = new_mse - old_mse
+        edge_loss = torch.sum(mse_delta * target_alpha_tile, dim=(1, 2, 3))  # (B,)
 
-        # 3. Das DELTA (Neu minus Alt). Negative Werte bedeuten Verbesserung!
-        mse = new_mse - old_mse
+        # ==========================================================
+        # 2. NEU: FARB-LOSS (L1/MAE-Fehler - Absolut, nicht quadriert!)
+        # Reagiert extrem empfindlich auf falsche Farbtöne in großen Flächen.
+        # ==========================================================
+        new_l1 = torch.mean(torch.tensor(torch.abs(blended_tile - target_tile)), dim=1, keepdim=True)
+        old_l1 = torch.mean(torch.tensor(torch.abs(canvas_tile - target_tile)), dim=1, keepdim=True)
+        l1_delta = new_l1 - old_l1
+        color_loss = torch.sum(l1_delta * target_alpha_tile, dim=(1, 2, 3))  # (B,)
 
-        # 2. Fehler nur dort werten, wo das Zielbild existiert (Ziel-Alpha > 0)
-        # sum(dim=(1,2,3)) fasst das ganze Kachel-Bild zu EINER Zahl pro Form zusammen
-        valid_loss = torch.sum(mse * target_alpha_tile, dim=(1, 2, 3))  # (B,)
-
-        # 3. SMOOTH PENALTY (Strafe fürs Rausmalen in den transparenten Hintergrund)
-        forbidden_zone = 1.0 - target_alpha_tile  # 1.0 im Hintergrund, 0.0 im Motiv
-        eff_c = (mask * alpha.view(B, 1, 1)).unsqueeze(1)  # (B, 1, H, W)
-
-        # Wie viel Farbe ist im verbotenen Bereich gelandet?
+        # ==========================================================
+        # 3. STRAFZONE (Rausmalen in den Hintergrund)
+        # ==========================================================
+        forbidden_zone = 1.0 - target_alpha_tile
+        eff_c = (mask * alpha.view(B, 1, 1)).unsqueeze(1)
         spill = eff_c * forbidden_zone
+        penalty = torch.sum(spill ** 2, dim=(1, 2, 3)) * 10.0  # (B,)
 
-        # Strafe: Quadriert (kleine Fehler = okay, große = massiv bestraft) * Gewichtung
-        penalty = torch.sum(spill ** 2, dim=(1, 2, 3)) * 30.0  # (B,)
-
-        # Der finale Score für den Adam Optimizer
-        total_score = valid_loss + penalty
-
+        # ==========================================================
+        # 4. DIE BALANCE (Der Tuning-Regler)
+        # Mit dem Faktor vor color_loss (hier 4.0) steuerst du, wie wichtig
+        # dem System die richtige Farbe gegenüber den Kanten ist!
+        # ==========================================================
+        COLOR_WEIGHT = 5.0
+        EDGE_WEIGHT = 2
+        total_score = (edge_loss * EDGE_WEIGHT) + (color_loss * COLOR_WEIGHT) + penalty
 
         return total_score

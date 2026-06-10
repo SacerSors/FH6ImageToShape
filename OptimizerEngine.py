@@ -42,7 +42,7 @@ class OptimizerEngine:
             params = torch.rand((n_samples, 6), device=device)  #Position
             params[:, 2:4] = params[:, 2:4] * size_range + min_size    #Größe
             params[:, 4] = params[:, 4] * math.pi   #Rotation
-            params[:, 5] /= 2.0  #Alpha
+            params[:, 5] = params[:, 5] * 0.5 + 0.5  # Alpha zwischen 0.5 und 1.0
 
             # Liste für die Ergebnisse
             all_scores = []
@@ -102,10 +102,17 @@ class OptimizerEngine:
         # ==========================================
         optimizer = torch.optim.Adam([geom_params], lr=0.1)
         resolution = target_img.shape[2]
-        MAX_SHIFT = 10.0 / resolution
+
+        MAX_STEP_SHIFT = 10.0 / resolution  # Geschwindigkeitsbegrenzung pro Schritt
+        MAX_TOTAL_TRAVEL = 16.0 / resolution  # Absoluter Radius (16px = 32px Puffer)
+
         MAX_SCALE = 0.05
         MAX_ROT = math.radians(10.0)
 
+        #Den Startpunkt als unumstößlichen Anker speichern!
+        anchor_positions = geom_params[:, 0:2].clone().detach()
+
+        max_sharpness = 195.0+n_mutate*2
         for step in range(1, n_mutate + 1):
             optimizer.zero_grad()
 
@@ -114,7 +121,7 @@ class OptimizerEngine:
 
             # Annealing
             progress = (step - 1) / max(1, n_mutate - 1)
-            sharpness = 20.0 + (progress**2 * 195.0)
+            sharpness = 40.0 + (progress**2 * max_sharpness)
 
             #Aus 4 Variablen wieder 6 zusammenkleben!
             # geom_params ist: [cx, cy, rh, angle]
@@ -148,17 +155,24 @@ class OptimizerEngine:
 
             # Harte Grenzen
             with torch.no_grad():
+                # 1. Schritt-Begrenzung (Wie schnell darf er laufen?)
                 delta = geom_params - params_before
-                # Begrenze die Sprünge für jeden Parameter einzeln
-                # geom_params enthält aktuell 5 Werte: [cx, cy, rw, rh, angle]
-                delta[:, 0:2].clamp_(-MAX_SHIFT, MAX_SHIFT)  # cx, cy
-                delta[:, 2:3].clamp_(-MAX_SCALE, MAX_SCALE)  #rh
+                delta[:, 0:2].clamp_(-MAX_STEP_SHIFT, MAX_STEP_SHIFT)  # cx, cy
+                delta[:, 2:3].clamp_(-MAX_SCALE, MAX_SCALE)  # rh
                 delta[:, 4:5].clamp_(-MAX_ROT, MAX_ROT)  # angle
 
                 geom_params.copy_(params_before + delta)
-                # 2. Größe (rh)
+
+                # 2. NEU: DER GEOFENCE (Wie weit darf er sich insgesamt vom Start entfernen?)
+                # Zwingt x und y strikt in den [Anker - 16px, Anker + 16px] Bereich!
+                geom_params[:, 0:2] = torch.max(
+                    torch.min(geom_params[:, 0:2], anchor_positions + MAX_TOTAL_TRAVEL),
+                    anchor_positions - MAX_TOTAL_TRAVEL
+                )
+
+                # 3. Absolute Bildgrenzen (darf nicht kleiner als min_size werden, etc.)
+                geom_params[:, 0:2].clamp_(0.0, 1.0)
                 geom_params[:, 2:3].clamp_(min_size, max_size)
-                # 3. Winkel (angle) lassen wir unangetastet rotieren
 
         # ==========================================
         # PHASE 4: DEN SIEGER KRÖNEN
@@ -187,6 +201,7 @@ class OptimizerEngine:
             return final_params[winner_idx], final_colors[winner_idx], final_scores[winner_idx]
 
     @staticmethod
+    @torch.compile
     def _extract_tiles(params, target_img, canvas_img, target_alpha, tile_size):
         """
         Der PyTorch Stanz-Automat. Schneidet B Kacheln in einem einzigen Takt aus.
