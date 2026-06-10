@@ -79,7 +79,12 @@ class VectorRenderer:
             ], device=self.device)
 
             color = torch.tensor(shape["color"], device=self.device) / 255.0
-            shape_type = 0 if shape["type"] == "ellipse" else 2
+            if shape["type"] == "ellipse":
+                shape_type = 0
+            elif shape["type"] == "rectangle":
+                shape_type = 1
+            else:
+                shape_type = 2
 
             # Zeichnen!
             self._update_canvas(params, color, shape_type)
@@ -95,8 +100,8 @@ class VectorRenderer:
             {"name": "LOD 2 (Mittel)", "res": 256, "brush_px": 60.0, "blur": 2,"q_limit": -30},
             # Ab hier gestochen scharf für die Details
             {"name": "LOD 3 (Fein)", "res": 1024, "brush_px": 60.0, "blur": 0,"q_limit": -60},
-            {"name": "LOD 4 (Makro)", "res": 2000, "brush_px": 60.0, "blur": 0,"q_limit": -100},
-            {"name": "LOD 4 (Makro)", "res": 4000, "brush_px": 60.0, "blur": 0,"q_limit": -50}
+            {"name": "LOD 4 (Makro)", "res": 2048, "brush_px": 60.0, "blur": 0,"q_limit": -100},
+            {"name": "LOD 5 (Makro)", "res": 4096, "brush_px": 60.0, "blur": 0,"q_limit": -50}
         ]
 
         print(f"🚀 Starte dynamisches Multi-Scale Rendering auf {self.device}")
@@ -143,7 +148,7 @@ class VectorRenderer:
             while global_shapes_drawn < total_shapes_target:
 
                 # Form-Typ basierend auf dem globalen Zähler
-                shape_type = 0 if global_shapes_drawn % 20 < 10 else 2
+                shape_type =  global_shapes_drawn % 3
                 # Aufmerksamkeitskarte (Fehlermaske = Nur das blanke Canvas)
 
                 if smart:
@@ -162,16 +167,17 @@ class VectorRenderer:
                     )
 
                 else:
+
                     best_params, best_color, best_score = OptimizerEngine.find_best_shape(
                         self.target_img, self.canvas_img, self.target_alpha,
                         shape_type=shape_type,
-                        n_samples=1024 * 10,
-                        n_mutate=32,
+                        n_samples=1024*4, #1024 * 10,
+                        n_mutate=16, #32
                         min_size=current_min_s,
                         max_size=current_max_s,
                         chunk_size=1024,
                         tile_size=current_tile_size,
-                        top_k=32,
+                        top_k=16, #32
                         optimizer_mode="dumb"
                     )
 
@@ -223,7 +229,13 @@ class VectorRenderer:
         cv2.imshow("Vector Renderer - Live Preview_2", display_img_2)
         cv2.waitKey(1)
 
-        shape_name = 'Ellipse' if shape_type == 0 else 'Dreieck'
+        if shape_type == 0:
+            shape_name = "Ellipse"
+        if shape_type == 1:
+            shape_name = "Triangle"
+        if shape_type == 2:
+            shape_name = "Rectangle"
+
         print(f"[{phase_name}] Form {step:>4}/{total_shapes} | {shape_name:<8} | Score: {best_score:.2f}")
 
     def _update_canvas(self, params: torch.Tensor, color: torch.Tensor, shape_type: int):
@@ -243,13 +255,21 @@ class VectorRenderer:
             self.canvas_img = (color_exp * effective_alpha) + (self.canvas_img * (1.0 - effective_alpha))
 
     def _save_to_memory(self, params: torch.Tensor, color: torch.Tensor, shape_type: int):
+        # Den Typen-Namen anhand deines Codes (0=ellipse, 1=rectangle, 2=triangle) zuweisen
+        if shape_type == 0:
+            type_str = "ellipse"
+        elif shape_type == 1:
+            type_str = "rectangle"
+        else:
+            type_str = "triangle"
+
         shape_data = {
-            "type": "ellipse" if shape_type == 0 else "triangle",
+            "type": type_str,
             "cx": params[0].item(),
             "cy": params[1].item(),
             "rw": params[2].item(),
             "rh": params[3].item(),
-            "angle": params[4].item() * (180.0 / math.pi),
+            "angle": params[4].item() * (180.0 / math.pi),  # Bogenmaß zurück in Grad
             "alpha": params[5].item(),
             "color": [
                 int(color[0].item() * 255),
@@ -269,14 +289,14 @@ class VectorRenderer:
 
 
 if __name__ == "__main__":
-    IMAGE_PATH = "frierenHeart.jpg"
+    IMAGE_PATH = "bilder/frierenAuto.webp"
 
     # Der Renderer bekommt nur noch den Pfad, er steuert die Auflösung jetzt selbst!
     renderer = VectorRenderer(IMAGE_PATH)
 
     # 10er Intervalle für das Live-Fenster sind angenehm flüssig
     time_start = time.time()
-    renderer.render(preview_interval=10, total_shapes_target=3000, smart=False)
+    renderer.render(preview_interval=20, total_shapes_target=500, smart=False)
     time_end = time.time()
     print(f"Dauer: {time_end - time_start}")
-    renderer.export_results("frieren_vektor.json", "frieren_vektor.png")
+    renderer.export_results("frieren_vektor_2.json", "frieren_vektor_2.png")
