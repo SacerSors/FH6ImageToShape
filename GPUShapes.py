@@ -54,7 +54,7 @@ class GPUShapes:
         return x_rot, y_rot
 
     @staticmethod
-    @torch.compile
+    @torch.compile(fullgraph=True)
     def sdf_ellipse(grid: torch.Tensor, params: torch.Tensor) -> torch.Tensor:
         """
         Algebraische SDF für eine Ellipse.
@@ -75,7 +75,7 @@ class GPUShapes:
         return (x_rot / rx_v) ** 2 + (y_rot / ry_v) ** 2 - 1.0
 
     @staticmethod
-    @torch.compile
+    @torch.compile(fullgraph=True)
     def sdf_rectangle(grid: torch.Tensor, params: torch.Tensor) -> torch.Tensor:
         """
         Exakte euklidische SDF für ein Rechteck (Inigo Quilez Methode).
@@ -94,8 +94,7 @@ class GPUShapes:
         qy = torch.abs(y_rot) - ry_v
 
         # max(q, 0) für die Distanz im Außenbereich
-        max_qx = torch.maximum(qx, torch.zeros_like(qx))
-        max_qy = torch.maximum(qy, torch.zeros_like(qy))
+        # OPTIMIZATION: Removed unused max_qx and max_qy tensors to save GPU memory & compute.
         outside_dist = torch.sqrt(
             torch.clamp(qx, min=0.0) ** 2 +
             torch.clamp(qy, min=0.0) ** 2 +

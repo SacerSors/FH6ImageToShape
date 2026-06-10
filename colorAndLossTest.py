@@ -60,13 +60,13 @@ class TestGPUColorAndLoss:
         # -------------------------------------------------------------
 
         # A) Finde die perfekten Farben!
-        colors = GPUColorAndLoss.compute_optimal_color(target_tile, canvas_tile, masks, alphas)
+        colors = GPUColorAndLoss.compute_optimal_color(target_tile, canvas_tile, masks, alphas, target_alpha_tile)
 
         # B) Zeichne die Formen auf die Leinwand
         blended = GPUColorAndLoss.blend_shape(canvas_tile, colors, masks, alphas)
 
         # C) Bewerte die Formen!
-        scores = GPUColorAndLoss.compute_score(blended, target_tile, target_alpha_tile, masks, alphas)
+        scores = GPUColorAndLoss.compute_score(blended, target_tile, target_alpha_tile, canvas_tile, masks, alphas, params)
 
         # Konsolen-Ausgabe der rohen Zahlen
         print("\n--- ERGEBNISSE DER MATHEMATIK ---")
@@ -121,9 +121,9 @@ class TestGPUColorAndLoss:
         masks = torch.sigmoid(-sdfs * 50.0)
 
         # --- DIE MAGIE TESTEN ---
-        colors = GPUColorAndLoss.compute_optimal_color(target_tile, canvas_tile, masks, alphas)
+        colors = GPUColorAndLoss.compute_optimal_color(target_tile, canvas_tile, masks, alphas, target_alpha_tile)
         blended = GPUColorAndLoss.blend_shape(canvas_tile, colors, masks, alphas)
-        scores = GPUColorAndLoss.compute_score(blended, target_tile, target_alpha_tile, masks, alphas)
+        scores = GPUColorAndLoss.compute_score(blended, target_tile, target_alpha_tile, canvas_tile, masks, alphas, params)
 
         # Konsolen-Ausgabe
         print("\n--- ERGEBNISSE MIT GRÜNEM HINTERGRUND ---")

@@ -196,7 +196,7 @@ class OptimizerEngine:
 
             return final_elites[winner_idx], final_colors[winner_idx], final_scores[winner_idx]
     @staticmethod
-    @torch.compile
+    @torch.compile(fullgraph=True)
     def _extract_tiles(params, target_img, canvas_img, target_alpha, tile_size):
         """
         Der PyTorch Stanz-Automat. Schneidet B Kacheln in einem einzigen Takt aus.
@@ -245,7 +245,7 @@ class OptimizerEngine:
         return T_target, T_canvas, T_alpha, local_grids
 
     @staticmethod
-    @torch.compile
+    @torch.compile(fullgraph=True)
     def _evolution_step(elites: torch.Tensor, progress: float, resolution: int,
                         min_size: float, max_size: float, shape_type: int,
                         T_target_k: torch.Tensor, T_canvas_k: torch.Tensor,
