@@ -152,26 +152,26 @@ class VectorRenderer:
                     best_params, best_color, best_score = OptimizerEngine.find_best_shape(
                         self.target_img, self.canvas_img, self.target_alpha,
                         shape_type=shape_type,
-                        n_samples=1024 * 40,
-                        n_mutate=86,
+                        n_samples=1024 * 10,
+                        n_mutate=32,
                         min_size=current_min_s,
                         max_size=current_max_s,
                         chunk_size=2048,
                         tile_size=current_tile_size,
-                        top_k=128
+                        top_k=32
                     )
 
                 else:
                     best_params, best_color, best_score = OptimizerEngine.find_best_shape(
                         self.target_img, self.canvas_img, self.target_alpha,
                         shape_type=shape_type,
-                        n_samples=1024 * 40,
-                        n_mutate=86,
+                        n_samples=1024 * 10,
+                        n_mutate=32,
                         min_size=current_min_s,
                         max_size=current_max_s,
-                        chunk_size=2048,
+                        chunk_size=1024,
                         tile_size=current_tile_size,
-                        top_k=128,
+                        top_k=32,
                         optimizer_mode="dumb"
                     )
 
@@ -276,7 +276,7 @@ if __name__ == "__main__":
 
     # 10er Intervalle für das Live-Fenster sind angenehm flüssig
     time_start = time.time()
-    renderer.render(preview_interval=10, total_shapes_target=3000, samrt=False)
+    renderer.render(preview_interval=10, total_shapes_target=3000, smart=False)
     time_end = time.time()
     print(f"Dauer: {time_end - time_start}")
     renderer.export_results("frieren_vektor.json", "frieren_vektor.png")
