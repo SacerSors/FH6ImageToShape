@@ -8,7 +8,7 @@ class GPUColorAndLoss:
     """
 
     @staticmethod
-    @torch.compile( )
+    @torch.compile(fullgraph=True)
     def compute_optimal_color(target_tile: torch.Tensor, canvas_tile: torch.Tensor,
                               mask: torch.Tensor, alpha: torch.Tensor,
                               target_alpha_tile: torch.Tensor) -> torch.Tensor:
@@ -33,7 +33,7 @@ class GPUColorAndLoss:
         return color
 
     @staticmethod
-    @torch.compile( )
+    @torch.compile(fullgraph=True)
     def blend_shape(canvas_tile: torch.Tensor, color: torch.Tensor,
                     mask: torch.Tensor, alpha: torch.Tensor) -> torch.Tensor:
         """
@@ -46,7 +46,7 @@ class GPUColorAndLoss:
         return eff_c * color_c + (1.0 - eff_c) * canvas_tile
 
     @staticmethod
-    @torch.compile( )
+    @torch.compile(fullgraph=True)
     def compute_score(blended_tile, target_tile, target_alpha_tile, canvas_tile, mask, alpha, params):
         B = mask.shape[0]
 
@@ -62,9 +62,11 @@ class GPUColorAndLoss:
         # ==========================================================
         # 2. NEU: FARB-LOSS (L1/MAE-Fehler - Absolut, nicht quadriert!)
         # Reagiert extrem empfindlich auf falsche Farbtöne in großen Flächen.
+        # OPTIMIZATION: Avoid wrapping existing tensors with torch.tensor() (e.g. torch.tensor(torch.abs(...)))
+        # This prevents breaking the computation graph, detaching gradients, and graph breaks in torch.compile.
         # ==========================================================
-        new_l1 = torch.mean(torch.tensor(torch.abs(blended_tile - target_tile)), dim=1, keepdim=True)
-        old_l1 = torch.mean(torch.tensor(torch.abs(canvas_tile - target_tile)), dim=1, keepdim=True)
+        new_l1 = torch.mean(torch.abs(blended_tile - target_tile), dim=1, keepdim=True)
+        old_l1 = torch.mean(torch.abs(canvas_tile - target_tile), dim=1, keepdim=True)
         l1_delta = new_l1 - old_l1
         color_loss = torch.sum(l1_delta * target_alpha_tile, dim=(1, 2, 3))  # (B,)
 

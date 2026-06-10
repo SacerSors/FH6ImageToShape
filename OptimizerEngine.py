@@ -45,18 +45,9 @@ class OptimizerEngine:
             for i in range(0, n_samples, chunk_size):
                 chunk_params = params[i: i + chunk_size]
 
-                T_target, T_canvas, T_alpha, local_grids = OptimizerEngine._extract_tiles(
-                    chunk_params, target_img, canvas_img, target_alpha, tile_size
+                scores = OptimizerEngine._phase1_chunk_step(
+                    chunk_params, target_img, canvas_img, target_alpha, tile_size, shape_type
                 )
-
-                sdfs = sdf_function(local_grids, chunk_params)
-                masks = torch.sigmoid(-sdfs * 1000.0)
-                alphas = chunk_params[:, 5]
-
-                colors = GPUColorAndLoss.compute_optimal_color(T_target, T_canvas, masks, alphas, T_alpha)
-                blended = GPUColorAndLoss.blend_shape(T_canvas, colors, masks, alphas)
-                scores = GPUColorAndLoss.compute_score(blended, T_target, T_alpha, T_canvas, masks, alphas,
-                                                       chunk_params)
 
                 all_scores.append(scores)
 
@@ -157,7 +148,7 @@ class OptimizerEngine:
 
             with torch.no_grad():
                 for gen in range(1, n_generations + 1):
-                    progress = 1.0 - (gen - 1) / n_generations
+                    progress = torch.tensor(1.0 - (gen - 1) / n_generations, device=device)
 
                     # Wir feuern den komplett durchkompilierten Kernel ab!
                     elites = OptimizerEngine._evolution_step(
@@ -196,7 +187,36 @@ class OptimizerEngine:
 
             return final_elites[winner_idx], final_colors[winner_idx], final_scores[winner_idx]
     @staticmethod
-    @torch.compile
+    @torch.compile(fullgraph=True)
+    def _phase1_chunk_step(chunk_params: torch.Tensor, target_img: torch.Tensor, canvas_img: torch.Tensor,
+                           target_alpha: torch.Tensor, tile_size: int, shape_type: int) -> torch.Tensor:
+        """
+        Phase 1 Chunk Logik in eine eigene fullgraph-kompilierbare Funktion ausgelagert.
+        """
+        T_target, T_canvas, T_alpha, local_grids = OptimizerEngine._extract_tiles(
+            chunk_params, target_img, canvas_img, target_alpha, tile_size
+        )
+
+        if shape_type == 0:
+            sdfs = GPUShapes.sdf_ellipse(local_grids, chunk_params)
+        elif shape_type == 1:
+            sdfs = GPUShapes.sdf_rectangle(local_grids, chunk_params)
+        else:
+            sdfs = GPUShapes.sdf_triangle(local_grids, chunk_params)
+
+        masks = torch.sigmoid(-sdfs * 1000.0)
+        alphas = chunk_params[:, 5]
+
+        colors = GPUColorAndLoss.compute_optimal_color(T_target, T_canvas, masks, alphas, T_alpha)
+        blended = GPUColorAndLoss.blend_shape(T_canvas, colors, masks, alphas)
+        scores = GPUColorAndLoss.compute_score(blended, T_target, T_alpha, T_canvas, masks, alphas,
+                                               chunk_params)
+
+        return scores
+
+
+    @staticmethod
+    @torch.compile(fullgraph=True)
     def _extract_tiles(params, target_img, canvas_img, target_alpha, tile_size):
         """
         Der PyTorch Stanz-Automat. Schneidet B Kacheln in einem einzigen Takt aus.
@@ -245,8 +265,8 @@ class OptimizerEngine:
         return T_target, T_canvas, T_alpha, local_grids
 
     @staticmethod
-    @torch.compile
-    def _evolution_step(elites: torch.Tensor, progress: float, resolution: int,
+    @torch.compile(fullgraph=True)
+    def _evolution_step(elites: torch.Tensor, progress: torch.Tensor, resolution: int,
                         min_size: float, max_size: float, shape_type: int,
                         T_target_k: torch.Tensor, T_canvas_k: torch.Tensor,
                         T_alpha_k: torch.Tensor, local_grids_k: torch.Tensor) -> torch.Tensor:
