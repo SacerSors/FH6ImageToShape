@@ -147,46 +147,25 @@ class VectorRenderer:
             self.target_alpha = torch.ones(self.resolution, self.resolution, device=self.device)
             while global_shapes_drawn < total_shapes_target:
 
-                # Form-Typ basierend auf dem globalen Zähler
-                shape_type =  global_shapes_drawn % 3
-                # Aufmerksamkeitskarte (Fehlermaske = Nur das blanke Canvas)
+                best_params, best_color, best_score = OptimizerEngine.find_best_shape(
+                    self.target_img, self.canvas_img, self.target_alpha,
+                    n_samples=1024*10, #1024 * 10,
+                    n_mutate=64, #32
+                    min_size=current_min_s,
+                    max_size=current_max_s,
+                    chunk_size=1024,
+                    tile_size=current_tile_size,
+                    top_k=32 #32
 
-                if smart:
-
-                # Engine abfeuern
-                    best_params, best_color, best_score = OptimizerEngine.find_best_shape(
-                        self.target_img, self.canvas_img, self.target_alpha,
-                        shape_type=shape_type,
-                        n_samples=1024 * 10,
-                        n_mutate=32,
-                        min_size=current_min_s,
-                        max_size=current_max_s,
-                        chunk_size=2048,
-                        tile_size=current_tile_size,
-                        top_k=32
-                    )
-
-                else:
-
-                    best_params, best_color, best_score = OptimizerEngine.find_best_shape(
-                        self.target_img, self.canvas_img, self.target_alpha,
-                        shape_type=shape_type,
-                        n_samples=1024*4, #1024 * 10,
-                        n_mutate=16, #32
-                        min_size=current_min_s,
-                        max_size=current_max_s,
-                        chunk_size=1024,
-                        tile_size=current_tile_size,
-                        top_k=16, #32
-                        optimizer_mode="dumb"
-                    )
+                )
+                shape_type = int(best_params[6].item())
 
 
                 # --- DER FILTER LOGIK-BLOCK ---
                 if best_score >= best_score_limit:
                     consecutive_bad_scores += 1
-
-                    print(f"{consecutive_bad_scores} Bad scores wurden gefunden.")
+                    if (consecutive_bad_scores-1) % 10 ==0:
+                        print(f"{consecutive_bad_scores} Bad scores wurden gefunden.")
 
                     # Wenn wir 100 Mal in Folge nichts Gutes mehr gefunden haben -> Break!
                     if consecutive_bad_scores >= MAX_BAD_SCORES:
@@ -201,8 +180,9 @@ class VectorRenderer:
                 global_shapes_drawn += 1  # Budget um 1 verringern
 
                 # Einbrennen & Speichern
-                self._update_canvas(best_params, best_color, shape_type)
-                self._save_to_memory(best_params, best_color, shape_type)
+                geom_only_final = best_params[ :6]
+                self._update_canvas(geom_only_final, best_color, shape_type)
+                self._save_to_memory(geom_only_final, best_color, shape_type)
 
                 # OpenCV Live Vorschau
                 if global_shapes_drawn % preview_interval == 0 or global_shapes_drawn == 1:
@@ -245,6 +225,8 @@ class VectorRenderer:
 
             if shape_type == 0:
                 sdfs = GPUShapes.sdf_ellipse(grid.unsqueeze(0), params_exp)
+            elif shape_type == 1:
+                sdfs = GPUShapes.sdf_rectangle(grid.unsqueeze(0), params_exp)
             else:
                 sdfs = GPUShapes.sdf_triangle(grid.unsqueeze(0), params_exp)
 

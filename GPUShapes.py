@@ -23,6 +23,7 @@ class GPUShapes:
         return torch.stack([grid_x, grid_y], dim=-1)
 
     @staticmethod
+    @torch.compile(fullgraph=True)
     def _transform_space(grid: torch.Tensor, cx: torch.Tensor, cy: torch.Tensor, angle_rad: torch.Tensor) -> tuple[
         torch.Tensor, torch.Tensor]:
         """
@@ -107,6 +108,7 @@ class GPUShapes:
         return (outside_dist + dist_in)
 
     @staticmethod
+    @torch.compile(fullgraph=True)
     def sdf_triangle(grid: torch.Tensor, params: torch.Tensor) -> torch.Tensor:
         """
         Normierte SDF für ein gleichschenkliges Dreieck.
