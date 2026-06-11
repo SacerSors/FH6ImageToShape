@@ -15,10 +15,17 @@ class OptimizerEngine:
     """
 
     @staticmethod
-    def find_best_shape(target_img: torch.Tensor, canvas_img: torch.Tensor, target_alpha: torch.Tensor,
-                        n_samples: int = 2000, top_k: int = 64,
-                        n_mutate: int = 40, tile_size: int = 112, chunk_size: int = 512,
-                        min_size: float = 0.02, max_size: float = 0.8) -> tuple:
+    def find_best_shape(target_img: torch.Tensor,
+                        canvas_img: torch.Tensor,
+                        target_alpha: torch.Tensor,
+                        n_samples: int = 2000,
+                        top_k: int = 64,
+                        n_mutate: int = 40,
+                        tile_size: int = 112,
+                        chunk_size: int = 512,
+                        min_size: float = 0.02,
+                        max_size: float = 0.8,
+                        patch_fov_px: float = 128.0) -> tuple:
 
         device = target_img.device
         # ==========================================
@@ -38,7 +45,7 @@ class OptimizerEngine:
                 chunk_params = params[i: i + chunk_size]
 
                 T_target, T_canvas, T_alpha, local_grids = OptimizerEngine._extract_tiles(
-                    chunk_params, target_img, canvas_img, target_alpha, tile_size
+                    chunk_params, target_img, canvas_img, target_alpha, tile_size, patch_fov_px
                 )
 
                 scores = OptimizerEngine.shotgun_score(
@@ -56,7 +63,7 @@ class OptimizerEngine:
 
 
         T_target_k, T_canvas_k, T_alpha_k, local_grids_k = OptimizerEngine._extract_tiles(
-            best_params, target_img, canvas_img, target_alpha, tile_size
+            best_params, target_img, canvas_img, target_alpha, tile_size,patch_fov_px
         )
 
         # ------------------------------------------
@@ -101,7 +108,7 @@ class OptimizerEngine:
             sdfs_t = GPUShapes.sdf_triangle(local_grids_k, geom_only_final)
 
             final_sdfs = torch.where(shape_types == 0, sdfs_e, torch.where(shape_types == 1, sdfs_r, sdfs_t))
-            final_masks = torch.sigmoid(-final_sdfs * 1000.0)
+            final_masks = (final_sdfs <= 0.0).float()
             final_alphas = final_elites[:, 5]
 
             final_colors = GPUColorAndLoss.compute_optimal_color(T_target_k, T_canvas_k, final_masks, final_alphas,
@@ -137,7 +144,7 @@ class OptimizerEngine:
                torch.where(shape_types == 1, sdfs_r, sdfs_t))
 
         # 3. Ab hier geht alles seinen normalen Weg
-        masks = torch.sigmoid(-sdfs * 1000.0)
+        masks = (sdfs <= 0.0).float()
         alphas = chunk_params[:, 5]
 
         # Das schwere Heben (Farbe & Loss) passiert nur 1x pro Shape!
@@ -149,10 +156,7 @@ class OptimizerEngine:
 
     @staticmethod
     @torch.compile(fullgraph=True)
-    def _extract_tiles(params, target_img, canvas_img, target_alpha, tile_size):
-        """
-        Der PyTorch Stanz-Automat. Schneidet B Kacheln in einem einzigen Takt aus.
-        """
+    def _extract_tiles(params, target_img, canvas_img, target_alpha, tile_size,patch_fov_px):
         B = params.shape[0]
         H, W = target_img.shape[1], target_img.shape[2]
         device = params.device
@@ -160,38 +164,31 @@ class OptimizerEngine:
         cx = params[:, 0]
         cy = params[:, 1]
 
-        # grid_sample erwartet Koordinaten von -1.0 bis +1.0 (Clip-Space)
+        # grid_sample erwartet Koordinaten von -1.0 bis +1.0
         tx = cx * 2.0 - 1.0
         ty = cy * 2.0 - 1.0
 
-        # Skalierungsfaktor für die Kachel (z.B. 112 / 1024)
-        scale = tile_size / H
+        # 1. Das Sichtfeld (FOV): Wie viel Prozent des Bildes schneiden wir aus?
+        scale = patch_fov_px / H
 
-        # Wir bauen eine affine Transformations-Matrix für jede der B Formen
-        # Form: [Scale, 0, Translate_X] und [0, Scale, Translate_Y]
         theta = torch.zeros((B, 2, 3), device=device)
         theta[:, 0, 0] = scale
         theta[:, 1, 1] = scale
         theta[:, 0, 2] = tx
         theta[:, 1, 2] = ty
 
-        # 1. Generiere das Kachel-Gitter im Clip-Space (-1 bis +1)
-        # align_corners=False ist wichtig für perfekte Pixel-Übereinstimmung
+        # 2. Die GPU-Auflösung (tile_sizey): Egal wie groß das Sichtfeld ist,
+        # der Tensor wird NIE größer als z.B. 128x128! Das rettet den VRAM.
         grid = F.affine_grid(theta, (B, 1, tile_size, tile_size), align_corners=False)
 
-        # 2. Stanze die Bilder aus! (Bilder auf Batch-Size aufblasen)
         target_exp = target_img.unsqueeze(0).expand(B, -1, -1, -1)
         canvas_exp = canvas_img.unsqueeze(0).expand(B, -1, -1, -1)
         alpha_exp = target_alpha.unsqueeze(0).unsqueeze(0).expand(B, -1, -1, -1)
 
-        # padding_mode='zeros' sorgt dafür, dass Kacheln am Bildrand außen schwarz werden
         T_target = F.grid_sample(target_exp, grid, align_corners=False, padding_mode='zeros')
         T_canvas = F.grid_sample(canvas_exp, grid, align_corners=False, padding_mode='zeros')
         T_alpha = F.grid_sample(alpha_exp, grid, align_corners=False, padding_mode='zeros')
 
-        # 3. Genialer Trick: Wir wandeln das Clip-Space-Gitter zurück in 0.0 bis 1.0
-        # Das wird unser 'local_grids' für Modul 1! Es enthält jetzt die ECHTEN
-        # globalen Koordinaten jedes einzelnen Pixels in der Kachel.
         local_grids = (grid + 1.0) / 2.0
 
         return T_target, T_canvas, T_alpha, local_grids
@@ -242,7 +239,7 @@ class OptimizerEngine:
 
         sdfs = torch.where(shape_types == 0, sdfs_e, torch.where(shape_types == 1, sdfs_r, sdfs_t))
 
-        masks = torch.sigmoid(-sdfs * 1000.0)
+        masks = (sdfs <= 0.0).float()
         alphas = mutant_params[:, 5]
 
         colors = GPUColorAndLoss.compute_optimal_color(T_target_m, T_canvas_m, masks, alphas, T_alpha_m)

@@ -55,7 +55,7 @@ class GPUShapes:
         return x_rot, y_rot
 
     @staticmethod
-    @torch.compile(fullgraph=True)
+    @torch.compile(fullgraph=True, mode="reduce-overhead")
     def sdf_ellipse(grid: torch.Tensor, params: torch.Tensor) -> torch.Tensor:
         """
         Algebraische SDF für eine Ellipse.

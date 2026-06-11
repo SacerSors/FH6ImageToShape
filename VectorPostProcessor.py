@@ -41,10 +41,12 @@ class VectorPostProcessor:
             with torch.no_grad():
                 if shape_type == 0:
                     sdfs = GPUShapes.sdf_ellipse(grid, params)
+                if shape_type == 1:
+                    sdfs = GPUShapes.sdf_rectangle(grid, params)
                 else:
                     sdfs = GPUShapes.sdf_triangle(grid, params)
 
-                mask = torch.sigmoid(-sdfs * 100.0)
+                mask = (sdfs <= 0.0).float()
                 eff_opacity = mask * shape["alpha"]
 
                 visible_contribution = eff_opacity * visibility_map
@@ -96,7 +98,7 @@ class VectorPostProcessor:
                 else:
                     sdfs = GPUShapes.sdf_triangle(grid, params)
 
-                mask = torch.sigmoid(-sdfs * 100.0).squeeze(0)
+                mask = (sdfs <= 0.0).float()
                 effective_alpha = mask * shape["alpha"]
 
                 canvas_img = (color * effective_alpha) + (canvas_img * (1.0 - effective_alpha))
