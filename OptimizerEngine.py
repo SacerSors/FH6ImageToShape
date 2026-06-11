@@ -25,20 +25,39 @@ class OptimizerEngine:
                         top_k: int = 64,
                         n_mutate: int = 40,
                         tile_size: int = 112,
-                        chunk_size: int = 512
-                        ) -> tuple:
+                        chunk_size: int = 512,
+                        heat_map: Tensor = None, #flat
+                        resolution=1024,
+                        alpha_base=0.5) -> tuple:
 
         device = target_img.device
         # ==========================================
         # PHASE 1: DIE SCHROTFLINTE (No Grad)
         # ==========================================
         with torch.no_grad():
-            size_range = max_size - min_size
-            params = torch.rand((n_samples, 7), device=device)  # Position
-            params[:, 2:4] = params[:, 2:4] * size_range + min_size  # Größe
-            params[:, 4] = params[:, 4] * math.pi  # Rotation
-            params[:, 5] = params[:, 5] * 0.5 + 0.5  # Alpha zwischen 0.5 und 1.0
-            params[:, 6] = torch.floor(torch.rand(n_samples, device=device) * 3.0)
+
+            if heat_map is None:
+                pos = torch.rand((n_samples, 2), device=device)  # Position
+            else:
+                sampled_indices = torch.multinomial(heat_map, num_samples=n_samples, replacement=True)
+
+                # 4. Indices zurück in X und Y Koordinaten (0.0 bis 1.0) umrechnen
+                pos_y = (sampled_indices // resolution).float() / resolution
+                pos_x = (sampled_indices % resolution).float() / resolution
+
+                # 5. Zu einem Tensor zusammenfügen
+                pos = torch.stack((pos_x, pos_y), dim=1)
+
+            size_w = torch.rand((n_samples, 1), device=device) * (max_size[0, 0] - min_size[0, 0]) + min_size[
+                0, 0]  # Spalte 2
+            size_h = torch.rand((n_samples, 1), device=device) * (max_size[0, 1] - min_size[0, 1]) + min_size[
+                0, 1]  # Spalte 3
+            rot = torch.rand((n_samples, 1), device=device) * math.pi  # Spalte 4
+            alpha = torch.rand((n_samples, 1), device=device) * alpha_base + 0.5  # Spalte 5
+            stype = torch.floor(torch.rand((n_samples, 1), device=device) * 3.0)  # Spalte 6
+
+            # Einmaliges Zusammenfügen
+            params = torch.cat([pos, size_w, size_h, rot, alpha, stype], dim=1)
 
             all_scores = []
 
@@ -50,7 +69,7 @@ class OptimizerEngine:
                 )
 
                 scores = OptimizerEngine.shotgun_score(
-                    chunk_params, T_target, T_canvas, T_alpha, local_grids
+                    chunk_params,min_size,max_size, T_target, T_canvas, T_alpha, local_grids
                 )
 
                 all_scores.append(scores.clone())
@@ -129,6 +148,7 @@ class OptimizerEngine:
     @staticmethod
     @torch.compile(fullgraph=True, mode="reduce-overhead")
     def shotgun_score(chunk_params: torch.Tensor,
+                        min_size: Tensor, max_size: Tensor,
                         T_target: torch.Tensor, T_canvas: torch.Tensor,
                         T_alpha: torch.Tensor, local_grids: torch.Tensor) -> torch.Tensor:
 
@@ -216,7 +236,8 @@ class OptimizerEngine:
         noise = torch.rand((n_elites * n_mutants, 6), device=elites.device) * 2.0 - 1.0
 
         cx_cy = (base_params[:, 0:2] + noise[:, 0:2] * shift_amplitude).clamp(0.0, 1.0)
-        rw_rh = (base_params[:, 2:4] + noise[:, 2:4] * scale_amplitude).clamp(min_size[0], max_size[0])
+        rw_rh_raw = base_params[:, 2:4] + noise[:, 2:4] * scale_amplitude
+        rw_rh = torch.minimum(torch.maximum(rw_rh_raw, min_size), max_size)
         angle = base_params[:, 4:5] + noise[:, 4:5] * rot_amplitude
         alpha = base_params[:, 5:6]
 

@@ -4,7 +4,6 @@ import torch
 import torchvision.transforms.functional as TF
 
 torch._dynamo.config.cache_size_limit = 64
-torch._logging.set_logs(recompiles=True, graph_breaks=True)
 
 from PIL import Image, ImageFilter
 import json
@@ -23,8 +22,10 @@ class VectorRenderer:
         self.last_score = -999
         self.target_alpha = None
         self.error_map = None
+        self.flat_error_map = None
         self.device = torch.device(device if device else ('cuda' if torch.cuda.is_available() else 'cpu'))
         self.image_path = image_path
+
 
         # Globale Vektor-Liste (Hier liegt unser eigentliches "Meisterwerk")
         self.vector_data = []
@@ -94,15 +95,19 @@ class VectorRenderer:
             self._update_canvas(params, color, shape_type)
 
     # Füge die Pinselgrößen (min_brush_px, max_brush_px) als Argumente hinzu
-    def render(self, preview_interval=10, min_brush_px=1.0, total_shapes_target=2000, smart=False):
+    def render(self, preview_interval=10, total_shapes_target=2000, sample_multi=1,
+               n_mutate=16, top_k=16, use_soft_filter = False):
 
-        self.resolution = 1024
+        self.resolution = 2048
         print(f"Starte Darwin-Renderer auf {self.device} | Auflösung: {self.resolution}x{self.resolution}")
         print(f"Ziel-Budget: {total_shapes_target} Formen insgesamt")
 
+
         global_shapes_drawn = 0
         consecutive_bad_scores = 0
+        soft_bad_scores = 0
         MAX_BAD_SCORES = 50
+        error_map_weight=0
 
         # 1. Leinwand exakt EINMAL aufbauen!
         self.target_img = self._load_target_image(self.resolution)
@@ -112,10 +117,15 @@ class VectorRenderer:
         self.full_grid = GPUShapes.create_relative_grid(self.resolution, self.resolution, self.device)
 
 
-        loss_filter_limit = 0.0
+        filter_hard_limit = 0.0 #Abbruchbedingung für eine Phase
+        filter_soft_limit = 0.0 #Damit am Anfang einer Phase nur die Besten shapes gewählt werden
+        filter_soft_cooldown = 3
 
         # NEU: Ein Speicher für die aktuelle Phase, um Rechenzeit zu sparen!
         current_computed_phase = -1
+
+        phase_score_sum = 0.0
+        phase_shapes_accepted = 0
 
         # 2. Die EINE saubere Render-Schleife
         while global_shapes_drawn < total_shapes_target:
@@ -126,48 +136,95 @@ class VectorRenderer:
             if self.ema_pinsel != current_computed_phase:
                 current_computed_phase = self.ema_pinsel
 
+                phase_score_sum = 0.0
+                phase_shapes_accepted = 0
+
+                # soft limit anhand der ersten shapes pro phase geschätzt
                 if self.ema_pinsel == 0:
                     current_brush = 0.9
-                    loss_filter_limit = -10.0
+                    filter_hard_limit = -10.0
+                    filter_soft_limit = -100
+                    error_map_weight= 0.1
                 elif self.ema_pinsel == 1:
                     current_brush =  0.40
-                    loss_filter_limit = -10
+                    filter_hard_limit = -10
+                    filter_soft_limit = -20
+                    error_map_weight=0.1
                 elif self.ema_pinsel == 2:
                     current_brush = 0.20
-                    loss_filter_limit = -15.0
+                    filter_hard_limit = -20.0
+                    filter_soft_limit = -75
+                    error_map_weight = 0.2
                 elif self.ema_pinsel == 3:
                     current_brush =  0.10
-                    loss_filter_limit = -20.0
+                    filter_hard_limit = -30.0
+                    filter_soft_limit = -200
+                    error_map_weight=0.5
                 elif self.ema_pinsel == 4:
                     current_brush =  0.05
-                    loss_filter_limit = -25.0
+                    filter_hard_limit = -50.0
+                    filter_soft_limit = -350
+                    error_map_weight = 0.6
                 elif self.ema_pinsel == 5:
                     current_brush =  0.03
-                    loss_filter_limit = -30.0
+                    filter_hard_limit = -65.0
+                    filter_soft_limit = -200
+                    error_map_weight = 0.75
                 elif self.ema_pinsel == 6:
                     current_brush =  0.02
-                    loss_filter_limit = -20.0
+                    filter_hard_limit = -50.0
+                    filter_soft_limit = -100
+                    error_map_weight = 0.8
                 elif self.ema_pinsel >= 7:
                     current_brush =  0.01
-                    loss_filter_limit = -20.0
+                    filter_hard_limit = -50.0
+                    filter_soft_limit = -50
                     self.last_pinsel = True
+                    MAX_BAD_SCORES *= 2
+                    error_map_weight = 0.9
 
+
+                self._update_error_map(error_map_weight)
                 # In relatives Maß (0.0 bis 1.0) umwandeln
                 current_max_s = current_brush
-
-                # Die Zange: Das Minimum ist immer strikt 33% vom Maximum!
-                current_min_s = current_max_s * 0.33
 
                 patch_fov_px = (current_brush * 2.0 * float(self.resolution)) + 48.0
                 current_tile_size = int(math.ceil(patch_fov_px / 32.0) * 32)
                 current_tile_size = max(64, current_tile_size)
                 current_tile_size = min(128, current_tile_size)
 
+                # 1. Das absolute GPU-Minimum (gegen Verschwinden der Form)
+                pixel_per_grid_cell = patch_fov_px / current_tile_size
+                absolute_min_px = max(2.0, pixel_per_grid_cell * 1.5)
+                gpu_safe_min_s = absolute_min_px / float(self.resolution)
+
+                # 2. Das Klobig-Minimum (gegen Erbsen-Formen)
+                chunky_min_s = current_max_s * 0.33
+
+                # --- NEU: ASYMMETRISCHE ZANGE ---
+                if self.ema_pinsel < 4:
+                    # Am Anfang: Beide Seiten müssen klobig sein
+                    min_w = chunky_min_s
+                    min_h = chunky_min_s
+                else:
+                    # Später: Die Länge (W) bleibt klobig, die Dicke (H) darf Spaghetti werden!
+                    min_w = chunky_min_s
+                    min_h = gpu_safe_min_s
+
+                # Sicherheits-Check
+                min_w = min(min_w, current_max_s * 0.5)
+                min_h = min(min_h, current_max_s * 0.5)
+
+                # Wir übergeben jetzt ein ARRAY aus 2 Werten! Shape: (1, 2)
+                min_size_t = torch.tensor([[min_w, min_h]], device=self.device)
+                max_size_t = torch.tensor([[current_max_s, current_max_s]], device=self.device)
+
+                print(f"\n" + "=" * 75)
+                print(f"PHASE {self.ema_pinsel} | Limit: {filter_hard_limit}")
                 print(
-                    f"\n🔄 Phase {self.ema_pinsel} aktiv | Pinsel max: {current_brush * self.resolution:.1f}px | Limit: {loss_filter_limit}")
+                    f"Pinsel Max: {current_max_s * self.resolution:>5.1f}px | Min Länge (W): {min_w * self.resolution:>5.1f}px | Min Dicke (H): {min_h * self.resolution:>5.1f}px")
+                print("=" * 75)
                 patch_fov_px_t = torch.tensor([patch_fov_px], device=self.device)
-                min_size_t = torch.tensor([current_min_s], device=self.device)
-                max_size_t = torch.tensor([current_max_s], device=self.device)
 
 
             # ====================================================================
@@ -175,28 +232,56 @@ class VectorRenderer:
             # ====================================================================
             best_params, best_color, best_score = OptimizerEngine.find_best_shape(
                 self.target_img, self.canvas_img, self.target_alpha,
-                n_samples=1024 * 4,
-                n_mutate=16,
+                n_samples=2048 * sample_multi,
+                n_mutate=n_mutate,
                 min_size=min_size_t,
                 max_size=max_size_t,
-                chunk_size=1024,
+                chunk_size=2048,
                 tile_size=current_tile_size,
                 patch_fov_px=patch_fov_px_t,
-                top_k=16
+                top_k=top_k,
+                resolution=self.resolution,
+                heat_map=self.flat_error_map,
+                alpha_base=min(current_brush,0.5)
             )
             shape_type = int(best_params[6].item())
 
             # ====================================================================
-            # FILTER & PHASEN-WECHSEL
+            # SOFT-FILTER
             # ====================================================================
-            if best_score > loss_filter_limit:
+
+            if (use_soft_filter and
+                     best_score > filter_soft_limit and filter_soft_limit < filter_hard_limit ):
+                soft_bad_scores +=1
+                if soft_bad_scores < filter_soft_cooldown:
+                    continue
+                else:
+                    filter_soft_limit *= 0.90
+                    print(f"Filter soft limit {filter_soft_limit:1f}")
+                    continue
+
+
+            # ====================================================================
+            # HARD-FILTER & PHASEN-WECHSEL
+            # ====================================================================
+            if best_score > filter_hard_limit:
                 consecutive_bad_scores += 1
+                if consecutive_bad_scores % 25 == 0 or consecutive_bad_scores == 1:
+                    print(f"    Filter Limit {consecutive_bad_scores*2}%")
 
                 if consecutive_bad_scores > MAX_BAD_SCORES:
                     consecutive_bad_scores = 0
+                    soft_bad_scores = 0
+                    if phase_shapes_accepted > 0:
+                        avg_score = phase_score_sum / phase_shapes_accepted
+                        print(f"Phase {self.ema_pinsel} abgeschlossen! | Akzeptierte Formen: {phase_shapes_accepted} | Ø-Score: {avg_score:.2f}")
 
                     if self.last_pinsel:
-                        print(f"🛑 Bild ist nach {global_shapes_drawn} Formen fertig (Letzter Pinsel ausgereizt).")
+                        print(f"Bild ist nach {global_shapes_drawn} Formen fertig (Letzter Pinsel ausgereizt).")
+                        if phase_shapes_accepted > 0:
+                            avg_score = phase_score_sum / phase_shapes_accepted
+                            print(
+                                f"Phase {self.ema_pinsel} abgeschlossen! | Akzeptierte Formen: {phase_shapes_accepted} | Ø-Score: {avg_score:.2f}")
                         break
 
                     # Phase erhöhen! Durch den Trick oben wird im nächsten Durchlauf
@@ -209,7 +294,15 @@ class VectorRenderer:
             # ERFOLG - FORM EINBRENNEN
             # ====================================================================
             consecutive_bad_scores = math.ceil(consecutive_bad_scores / 2)
+            soft_bad_scores = 0
             global_shapes_drawn += 1
+
+            if global_shapes_drawn % 100 == 0:
+                self._update_error_map(error_map_weight)
+                print("    [Info] Error Map für Importance Sampling aktualisiert.")
+
+            phase_score_sum += best_score
+            phase_shapes_accepted += 1
 
             geom_only_final = best_params[:6]
             self._update_canvas(geom_only_final, best_color, shape_type)
@@ -217,36 +310,31 @@ class VectorRenderer:
 
             # OpenCV Live Vorschau
             if global_shapes_drawn % preview_interval == 0 or global_shapes_drawn == 1:
-                self._show_preview("Darwin Mode", global_shapes_drawn, total_shapes_target, best_score, shape_type)
-
+                self._show_preview(self.canvas_img, "Vector Renderer - Live Preview")
+                print(f"    Form {global_shapes_drawn:>4}/{total_shapes_target}  | Score: {best_score:.2f}")
             if global_shapes_drawn >= total_shapes_target:
-                print(f"🎉 Globales Ziel-Budget von {total_shapes_target} Formen erreicht! Beende Rendering.")
+
+                print(f"Ziel-Budget von {total_shapes_target} Formen erreicht! Beende Rendering.")
                 break
 
-        cv2.destroyAllWindows()
+        #cv2.destroyAllWindows()
 
-    def _show_preview(self, phase_name, step, total_shapes, best_score, shape_type):
+    def _show_preview(self, img, window_name):
         """Kapselt die OpenCV Logik sicher ein."""
 
-        np_img_2 = (self.canvas_img.permute(1, 2, 0).cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
+        if img.ndim == 3:
+            np_img_2 = (img.permute(1, 2, 0).cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
+        else:
+            np_img_2 = (img.cpu().numpy() * 255).astype(np.uint8)
         bgr_img_2 = cv2.cvtColor(np_img_2, cv2.COLOR_RGB2BGR)
 
-        # Egal wie groß das Bild intern ist (selbst bei 2048x2048),
-        # wir zeigen das Vorschau-Fenster immer angenehm in 512x512 an!
+        # wir zeigen das Vorschau-Fenster immer in 512x512 an!
         display_img_2 = cv2.resize(bgr_img_2, (512, 512), interpolation=cv2.INTER_AREA)
-
-
-        cv2.imshow("Vector Renderer - Live Preview_2", display_img_2)
+        cv2.imshow(window_name, display_img_2)
         cv2.waitKey(1)
 
-        if shape_type == 0:
-            shape_name = "Ellipse"
-        if shape_type == 1:
-            shape_name = "Triangle"
-        if shape_type == 2:
-            shape_name = "Rectangle"
 
-        print(f"[{phase_name}] Form {step:>4}/{total_shapes} | {shape_name:<8} | Score: {best_score:.2f}")
+
 
     def _update_canvas(self, params: torch.Tensor, color: torch.Tensor, shape_type: int):
         with torch.no_grad():
@@ -302,6 +390,23 @@ class VectorRenderer:
         final_image.save(img_path)
         print(f"\n🎉 Fertig! Vektordaten: {json_path} | Bild-Auflösung: {self.resolution}x{self.resolution}")
 
+    def _update_error_map(self, gewichtung):
+        """Berechnet die flache Wahrscheinlichkeitskarte für das Importance Sampling."""
+        with torch.no_grad():
+            # 1. Differenz berechnen (L1 Fehler)
+            diff = torch.abs(self.target_img - self.canvas_img)
+
+            # 2. Auf 2D reduzieren (Mittelwert der 3 Farbkanäle RGB)
+            # Resultat: Tensor der Größe (2048, 2048)
+            self.error_map = torch.mean(diff, dim=0)
+            self._show_preview(self.error_map, "Error-Map")
+
+            # OPTIONAL: Hier könntest du später deine manuelle Forza-Heatmap reinmultiplizieren!
+            # error_2d = error_2d * self.forza_heatmap
+
+            # 3. Flachdrücken und Grundrauschen addieren (direkt fertig für multinomial!)
+            self.flat_error_map = self.error_map.view(-1) + (1-gewichtung)
+
 
 if __name__ == "__main__":
     IMAGE_PATH = "bilder/frierenHeart.jpg"
@@ -311,7 +416,13 @@ if __name__ == "__main__":
 
     # 10er Intervalle für das Live-Fenster sind angenehm flüssig
     time_start = time.time()
-    renderer.render(preview_interval=20, total_shapes_target=3000, smart=False)
+    renderer.render(preview_interval=20,
+                    total_shapes_target=3000,
+                    n_mutate=48,
+                    top_k=32,
+                    sample_multi=4, # 2048*sample_multi
+                    use_soft_filter=True
+                    )
     time_end = time.time()
     print(f"Dauer: {time_end - time_start}")
     renderer.export_results("frieren_vektor.json", "frieren_vektor.png")

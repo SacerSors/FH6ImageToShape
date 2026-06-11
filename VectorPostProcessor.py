@@ -119,9 +119,9 @@ class VectorPostProcessor:
 
 if __name__ == "__main__":
     # === EINSTELLUNGEN ===
-    INPUT_JSON = "bilder/frieren_vektor_2.json"  # Deine rohe Render-Datei
+    INPUT_JSON = "frieren_vektor.json"  # Deine rohe Render-Datei
     OUTPUT_JSON = "frieren_pruned.json"  # Die neue, gesäuberte Datei
-    THRESHOLD = 0.0  # %-Einfluss (Höher = mehr Formen werden gelöscht)
+    THRESHOLD = 0.001  # %-Einfluss (Höher = mehr Formen werden gelöscht)
     PREVIEW_INTERVAL = 25  # Alle X Formen das Bild updaten
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
