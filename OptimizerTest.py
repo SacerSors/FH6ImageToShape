@@ -57,7 +57,7 @@ class TestOptimizerEngine:
                 target_img=target_img,
                 canvas_img=canvas_img,
                 target_alpha=target_alpha,
-                shape_type=shape_type,
+
                 n_samples=2000,
                 top_k=64,
                 n_mutate=40,
@@ -75,7 +75,7 @@ class TestOptimizerEngine:
             # 4. Den Sieger für den Plot auf die Leinwand malen
             with torch.no_grad():
                 # Tensoren auf Batch-Size 1 aufblasen für die Funktionen
-                p_b = params.unsqueeze(0)
+                p_b = params[:6].unsqueeze(0)
                 c_b = color.unsqueeze(0)
                 grid_b = grid.unsqueeze(0)
 

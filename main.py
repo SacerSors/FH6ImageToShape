@@ -149,7 +149,7 @@ class VectorRenderer:
 
                 best_params, best_color, best_score = OptimizerEngine.find_best_shape(
                     self.target_img, self.canvas_img, self.target_alpha,
-                    n_samples=1024*10, #1024 * 10,
+                    n_samples=1024*10, # Must be a multiple of chunk_size for reduce-overhead!
                     n_mutate=64, #32
                     min_size=current_min_s,
                     max_size=current_max_s,

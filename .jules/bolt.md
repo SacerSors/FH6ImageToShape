@@ -4,4 +4,6 @@
 
 ## 2024-06-10 - Removing Unused GPU Variables
 **Learning:** Unused tensors like `max_qx` and `max_qy` in kernel computations (e.g., `sdf_rectangle`) waste GPU memory and compute cycles, especially during high-throughput optimization loops.
-**Action:** Ensure that variables declared inside heavily called GPU kernels are actually used in the computation, and clean up any unused intermediate outputs.
+**Action:** Ensure that variables declared inside heavily called GPU kernels are actually used in the computation, and clean up any unused intermediate outputs.## 2025-05-18 - [Add reduce-overhead to torch.compile]
+**Learning:** Using `mode="reduce-overhead"` in `@torch.compile` leverages CUDA Graphs to avoid CPU overhead entirely. It requires constant batch sizes (so batch splitting loops must be exact multiples without padding) and does not tolerate any Dynamo graph breaks. Furthermore, applying `mode="reduce-overhead"` should only be done at the outermost execution boundary (entry points) instead of inner functions. Otherwise it might create nested graphs and cause graph breaks. Finally, `reduce-overhead` fails when `unbind` unpacks fewer elements than are actually passed in (e.g. 7 elements unpacked into 6 vars causes an invisible graph break).
+**Action:** When working with `reduce-overhead`, make sure all chunks and dynamic dimensions are fixed/constant and verify unpacking counts match passed parameter counts. I fixed the code by slicing the tensor to the correct size (`params[:6]`) before passing it to inner functions.
