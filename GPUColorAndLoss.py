@@ -85,6 +85,5 @@ class GPUColorAndLoss:
         # ==========================================================
         COLOR_WEIGHT = 5.0
         EDGE_WEIGHT = 2
-        total_score = (edge_loss * EDGE_WEIGHT) + (color_loss * COLOR_WEIGHT) + penalty
 
-        return total_score
+        return (edge_loss * EDGE_WEIGHT) + (color_loss * COLOR_WEIGHT) + penalty

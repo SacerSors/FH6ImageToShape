@@ -18,14 +18,15 @@ class OptimizerEngine:
     def find_best_shape(target_img: torch.Tensor,
                         canvas_img: torch.Tensor,
                         target_alpha: torch.Tensor,
+                        min_size: Tensor,
+                        max_size: Tensor,
+                        patch_fov_px: Tensor,
                         n_samples: int = 2000,
                         top_k: int = 64,
                         n_mutate: int = 40,
                         tile_size: int = 112,
-                        chunk_size: int = 512,
-                        min_size: float = 0.02,
-                        max_size: float = 0.8,
-                        patch_fov_px: float = 128.0) -> tuple:
+                        chunk_size: int = 512
+                        ) -> tuple:
 
         device = target_img.device
         # ==========================================
@@ -52,7 +53,7 @@ class OptimizerEngine:
                     chunk_params, T_target, T_canvas, T_alpha, local_grids
                 )
 
-                all_scores.append(scores)
+                all_scores.append(scores.clone())
             final_scores_phase1 = torch.cat(all_scores, dim=0)
 
         # ==========================================
@@ -73,12 +74,14 @@ class OptimizerEngine:
 
         n_generations = n_mutate  # Wir nutzen n_mutate als Anzahl der Generationen
 
+        progress_tensor = torch.zeros(1, device=device)
+
         resolution = target_img.shape[2]
 
         with torch.no_grad():
             for gen in range(1, n_generations + 1):
                 progress = 1.0 - (gen - 1) / n_generations
-                progress_tensor = torch.tensor([progress], device=device)
+                progress_tensor.fill_(progress)
                 # Wir feuern den komplett durchkompilierten Kernel ab!
                 elites = OptimizerEngine._evolution_step(
                     elites=elites,
@@ -90,7 +93,7 @@ class OptimizerEngine:
                     T_canvas_k=T_canvas_k,
                     T_alpha_k=T_alpha_k,
                     local_grids_k=local_grids_k
-                )
+                ).clone()
 
         final_elites = elites
 
@@ -124,7 +127,7 @@ class OptimizerEngine:
             return final_elites[winner_idx], final_colors[winner_idx], final_scores[winner_idx]
 
     @staticmethod
-    @torch.compile(fullgraph=True)
+    @torch.compile(fullgraph=True, mode="reduce-overhead")
     def shotgun_score(chunk_params: torch.Tensor,
                         T_target: torch.Tensor, T_canvas: torch.Tensor,
                         T_alpha: torch.Tensor, local_grids: torch.Tensor) -> torch.Tensor:
@@ -169,7 +172,7 @@ class OptimizerEngine:
         ty = cy * 2.0 - 1.0
 
         # 1. Das Sichtfeld (FOV): Wie viel Prozent des Bildes schneiden wir aus?
-        scale = patch_fov_px / H
+        scale = patch_fov_px[0] / H
 
         theta = torch.zeros((B, 2, 3), device=device)
         theta[:, 0, 0] = scale
@@ -194,9 +197,9 @@ class OptimizerEngine:
         return T_target, T_canvas, T_alpha, local_grids
 
     @staticmethod
-    @torch.compile(fullgraph=True)
+    @torch.compile(fullgraph=True,  mode="reduce-overhead")
     def _evolution_step(elites: torch.Tensor, progress: torch.Tensor, resolution: int,
-                        min_size: float, max_size: float,
+                        min_size: Tensor, max_size: Tensor,
                         T_target_k: torch.Tensor, T_canvas_k: torch.Tensor,
                         T_alpha_k: torch.Tensor, local_grids_k: torch.Tensor) -> torch.Tensor:
 
@@ -213,7 +216,7 @@ class OptimizerEngine:
         noise = torch.rand((n_elites * n_mutants, 6), device=elites.device) * 2.0 - 1.0
 
         cx_cy = (base_params[:, 0:2] + noise[:, 0:2] * shift_amplitude).clamp(0.0, 1.0)
-        rw_rh = (base_params[:, 2:4] + noise[:, 2:4] * scale_amplitude).clamp(min_size, max_size)
+        rw_rh = (base_params[:, 2:4] + noise[:, 2:4] * scale_amplitude).clamp(min_size[0], max_size[0])
         angle = base_params[:, 4:5] + noise[:, 4:5] * rot_amplitude
         alpha = base_params[:, 5:6]
 
