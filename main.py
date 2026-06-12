@@ -3,6 +3,8 @@ import time
 import torch
 import torchvision.transforms.functional as TF
 
+from profil import RenderPreset
+
 torch._dynamo.config.cache_size_limit = 64
 
 from PIL import Image, ImageFilter
@@ -16,6 +18,8 @@ from GPUShapes import GPUShapes
 
 class VectorRenderer:
     def __init__(self, image_path, device=None):
+        self.telemetry_data = []
+        self.deleted_scores = []
         self.full_grid = None
         self.last_pinsel = False
         self.ema_pinsel = 0
@@ -95,27 +99,32 @@ class VectorRenderer:
             self._update_canvas(params, color, shape_type)
 
     # Füge die Pinselgrößen (min_brush_px, max_brush_px) als Argumente hinzu
-    def render(self, preview_interval=10, total_shapes_target=2000, sample_multi=1,
-               n_mutate=16, top_k=16, use_soft_filter = False):
+    def render(self,preset: RenderPreset ,preview_interval=10, total_shapes_target=2000, telemetry = False,
+               wait_at_finisch=True):
 
-        self.resolution = 2048
-        print(f"Starte Darwin-Renderer auf {self.device} | Auflösung: {self.resolution}x{self.resolution}")
-        print(f"Ziel-Budget: {total_shapes_target} Formen insgesamt")
+        cfg = preset.value
+
+        self.resolution = cfg["resolution"]
+        print(f"\nStarte Darwin-Renderer im Modus: [{preset.name}]")
+        print(f"   Mutations: {cfg['n_mutate']} | Samples: {1024 * cfg['sample_multi']} | Patience: {cfg['patience_factor']}")
 
         global_shapes_drawn = 0
+        bad_shapes_count = 0
 
-
+        global_shapes_drawn = 0
+        bad_shapes_count = 0
 
         # ====================================================================
-        # EMA Parameter
+        # EMA Parameter (jetzt dynamisch aus dem Enum)
         # ====================================================================
         ema_score = None
-        patience_factor = 0.35  # Wir akzeptieren Formen, die mind. 35% so gut sind wie der Schnitt
+        first_ema_score = True
+        patience_factor = cfg["patience_factor"]
         self.spaghetti_unlocked = False
-        ema_negativ_reaction = 0.02
-        ema_positiv_reaction = 0.15
+        ema_negativ_reaction = cfg["ema_negativ_reaction"]
+        ema_positiv_reaction = cfg["ema_positiv_reaction"]
         consecutive_bad_scores = 0
-        MAX_BAD_SCORES = 50 # Nach so vielen Versuchen wird auf Lokales maximum gesetzt
+        MAX_BAD_SCORES = cfg["MAX_BAD_SCORES"]
         best_rejected_score = float('inf')
 
 
@@ -136,27 +145,29 @@ class VectorRenderer:
         phase_score_sum = 0.0
         phase_shapes_accepted = 0
 
+
+
         # 2. Die EINE saubere Render-Schleife
         while global_shapes_drawn < total_shapes_target:
 
             # ====================================================================
             # PinselLogik
             # ====================================================================
-
             start_brush = 0.9
-            end_brush = 0.01
-            progress = global_shapes_drawn / total_shapes_target
+            end_brush = 0.015 if preset == RenderPreset.ULTRA else 0.01  # Luft nach oben für Ultra
+            max_virtual_progress = 2000
+            pinsel_error_step_size = 1
 
-            # HÄLT DEN PINSEL LÄNGER GROSS:
-            # adjusted_progress = math.pow(progress, 2.0)
+            progress = (global_shapes_drawn + (
+                        min(bad_shapes_count, max_virtual_progress) // pinsel_error_step_size)) / (
+                                   total_shapes_target + max_virtual_progress)
 
-            # LÄSST DEN PINSEL SOFORT SCHRUMPFEN:
-            # adjusted_progress = math.pow(progress, 0.5)
-
-            current_max_s = start_brush * math.pow((end_brush / start_brush), progress)
+            # Steilheit wird aus dem Enum gezogen!
+            adjusted_progress = math.pow(progress, cfg["pinsel_steilheit"])
+            current_max_s = start_brush * math.pow((end_brush / start_brush), adjusted_progress)
 
             # ErrorMap gewicht anpassen
-            error_map_weight = 0.1 + (0.8 * progress)
+            error_map_weight = min(0.4 + (0.7 * progress), 0.9)
 
 
             # ====================================================================
@@ -175,13 +186,14 @@ class VectorRenderer:
 
             # Das Klobig-Minimum (1/3) und das absolute GPU-Minimum (1.5 Pixel)
             pixel_per_grid_cell = patch_fov_px / current_tile_size
-            gpu_safe_min_s = max(2.0, pixel_per_grid_cell * 1.5) / float(self.resolution)
+            gpu_safe_min_s = max(1.5, pixel_per_grid_cell * 1.5) / float(self.resolution)
             chunky_min_s = current_max_s * 0.33
 
             # ====================================================================
             # 4. DIE SPAGHETTI-ZANGE & MILESTONE-RESET
             # ====================================================================
-            if progress < 0.5:
+            spaghetti_threshold = 0.2
+            if current_max_s > spaghetti_threshold:
                 # Phase 1: Blockout (Beide Seiten klobig)
                 min_w = chunky_min_s
                 min_h = chunky_min_s
@@ -210,17 +222,17 @@ class VectorRenderer:
             # ====================================================================
             best_params, best_color, best_score = OptimizerEngine.find_best_shape(
                 self.target_img, self.canvas_img, self.target_alpha,
-                n_samples=2048 * sample_multi,
-                n_mutate=n_mutate,
+                n_samples=1024 * cfg["sample_multi"],
+                n_mutate=cfg["n_mutate"],
                 min_size=min_size_t,
                 max_size=max_size_t,
-                chunk_size=2048,
+                chunk_size=1024 * cfg["batch_multi"],
                 tile_size=current_tile_size,
                 patch_fov_px=patch_fov_px_t,
-                top_k=top_k,
+                top_k=cfg["top_k"],
                 resolution=self.resolution,
                 heat_map=self.flat_error_map,
-                alpha_base=min(current_max_s,0.5)
+                alpha_base=min(current_max_s, 0.5)
             )
             shape_type = int(best_params[6].item())
 
@@ -229,7 +241,7 @@ class VectorRenderer:
             # ====================================================================
             if best_score > filter_hard_limit:
                 consecutive_bad_scores += 1
-
+                bad_shapes_count+=1
                 if best_score < best_rejected_score:
                     best_rejected_score = best_score
                 # Wenn wir absolut feststecken (z.B. 50x in Folge Müll gefunden),
@@ -241,6 +253,11 @@ class VectorRenderer:
                     best_rejected_score = float('inf') #speicher für lokales maximum zurücksetzen
                     print(f"    [Warnung] Stecke fest! EMA-Limit auf {ema_score} gesetzt.")
 
+                if telemetry:
+                    # Wir zwingen best_score und ema_score explizit zu normalen Floats
+                    s = float(best_score)
+                    e = float(ema_score) if ema_score is not None else None
+                    self.deleted_scores.append([s, e])
                 continue  #Form wegwerfen
 
             # ====================================================================
@@ -252,7 +269,11 @@ class VectorRenderer:
 
             # --- NEU: Asymmetrisches EMA Update ---
             if ema_score is None:
-                ema_score = best_score
+                if first_ema_score:
+                    first_ema_score = False
+                    ema_score = None
+                else:
+                    ema_score = best_score
             else:
                 # WICHTIG: best_score ist negativ. Ein kleinerer Wert (z.B. -200) ist BESSER als -50.
                 if best_score < ema_score:
@@ -279,16 +300,30 @@ class VectorRenderer:
             self._save_to_memory(geom_only_final, best_color, shape_type)
 
             # OpenCV Live Vorschau
-            if global_shapes_drawn % preview_interval == 0 or global_shapes_drawn == 1:
+            if global_shapes_drawn % preview_interval == 0:
                 self._show_preview(self.canvas_img, "Vector Renderer - Live Preview")
-                print(f"    Form {global_shapes_drawn:>4}/{total_shapes_target}  | Score: {best_score:.2f}"
-                      f"| EMA: {ema_score:.2f}")
+                if ema_score is not None:
+                    print(f"    Form {global_shapes_drawn:>4}/{total_shapes_target}  | Score: {best_score:.2f}"
+                      f"| EMA: {ema_score:.2f} | PinselMax: {current_max_s}")
             if global_shapes_drawn >= total_shapes_target:
 
                 print(f"Ziel-Budget von {total_shapes_target} Formen erreicht! Beende Rendering.")
+                print(f"{bad_shapes_count} Shapes Weg geworfen. ({bad_shapes_count/(total_shapes_target+bad_shapes_count)*100:.2f}%)")
                 break
 
-        #cv2.destroyAllWindows()
+            if telemetry:
+                self.telemetry_data.append({
+                    "geometry": geom_only_final.cpu().tolist(),  # <-- HIER FIXEN
+                    "score": float(best_score),
+                    "ema": float(ema_score) if ema_score is not None else 0.0,
+                    "pinsel_max": float(current_max_s),
+                    "color": best_color.cpu().tolist(),  # <-- HIER FIXEN
+                    "shape_type": shape_type,
+                })
+
+        if wait_at_finisch:
+            cv2.waitKey()
+        cv2.destroyAllWindows()
 
     def _show_preview(self, img, window_name):
         """Kapselt die OpenCV Logik sicher ein."""
@@ -353,30 +388,48 @@ class VectorRenderer:
         }
         self.vector_data.append(shape_data)
 
-    def export_results(self, json_path="output.json", img_path="output.png"):
+    def export_results(self, json_path="output.json", img_path="output.png", telemetry_path="telemetry.json"):
+        # 1. Das normale Bild-JSON für den Viewer/die SVG
         with open(json_path, 'w') as f:
             json.dump(self.vector_data, f, indent=4)
 
+        # 2. Das Bild abspeichern
         final_image = TF.to_pil_image(self.canvas_img.cpu())
         final_image.save(img_path)
+
+        # 3. NEU: Die Telemetrie für unser Dashboard exportieren!
+        telemetry_export = {
+            "accepted": self.telemetry_data,
+            "rejected": self.deleted_scores
+        }
+        with open(telemetry_path, 'w') as f:
+            json.dump(telemetry_export, f, indent=4)
+
         print(f"\n🎉 Fertig! Vektordaten: {json_path} | Bild-Auflösung: {self.resolution}x{self.resolution}")
+        print(f"📊 Deep Research Daten gespeichert unter: {telemetry_path}")
 
     def _update_error_map(self, gewichtung):
-        """Berechnet die flache Wahrscheinlichkeitskarte für das Importance Sampling."""
         with torch.no_grad():
-            # 1. Differenz berechnen (L1 Fehler)
-            diff = torch.abs(self.target_img - self.canvas_img)
+            # 1. Differenz pro Kanal
+            diff = torch.abs(self.target_img - self.canvas_img)  # (3, 2048, 2048)
 
-            # 2. Auf 2D reduzieren (Mittelwert der 3 Farbkanäle RGB)
-            # Resultat: Tensor der Größe (2048, 2048)
-            self.error_map = torch.mean(diff, dim=0)
-            self._show_preview(self.error_map, "Error-Map")
+            # 2. Luminanz-Gewichtung (Helle Bereiche sind wichtiger)
+            # Wir nehmen das Zielbild als Referenz für Helligkeit
+            luminance = torch.mean(self.target_img, dim=0)
 
-            # OPTIONAL: Hier könntest du später deine manuelle Forza-Heatmap reinmultiplizieren!
-            # error_2d = error_2d * self.forza_heatmap
+            # 3. Farbdifferenz + Helligkeits-Boost
+            # Wir multiplizieren den Fehler mit der Luminanz, um Highlights zu pushen
+            # Highlights (hell) im Original sollen mehr Fehlermeldung erzeugen
+            color_error = torch.mean(diff, dim=0)
+            self.error_map = color_error * (1.0 + luminance * 2.0)
 
-            # 3. Flachdrücken und Grundrauschen addieren (direkt fertig für multinomial!)
-            self.flat_error_map = self.error_map.view(-1) + (1-gewichtung)
+            # optional: Sättigungs-Boost für die Augen/Ohrringe
+            # Dies ist ein "Pro-Feature": Je gesättigter das Original, desto wichtiger
+            saturation = torch.std(self.target_img, dim=0)
+            self.error_map = self.error_map * (1.0 + saturation * 3.0)
+
+            self._show_preview(self.error_map, "Color-Aware Error-Map")
+            self.flat_error_map = self.error_map.view(-1) + (1 - gewichtung)
 
 
 if __name__ == "__main__":
@@ -387,13 +440,13 @@ if __name__ == "__main__":
 
     # 10er Intervalle für das Live-Fenster sind angenehm flüssig
     time_start = time.time()
-    renderer.render(preview_interval=20,
-                    total_shapes_target=3000,
-                    n_mutate=48,
-                    top_k=32,
-                    sample_multi=4, # 2048*sample_multi
-                    use_soft_filter=True
-                    )
+    renderer.render(
+        preset=RenderPreset.ULTRA_FAST,
+        preview_interval=1,
+        total_shapes_target=3000,
+        telemetry=True,
+        wait_at_finisch=False
+    )
     time_end = time.time()
     print(f"Dauer: {time_end - time_start}")
-    renderer.export_results("frieren_vektor.json", "frieren_vektor.png")
+    renderer.export_results("frierenHeart.json", "frierenHeart_vektor_UltraFast.png")
