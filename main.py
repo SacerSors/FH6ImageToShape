@@ -102,14 +102,28 @@ class VectorRenderer:
         print(f"Starte Darwin-Renderer auf {self.device} | Auflösung: {self.resolution}x{self.resolution}")
         print(f"Ziel-Budget: {total_shapes_target} Formen insgesamt")
 
-
         global_shapes_drawn = 0
-        consecutive_bad_scores = 0
-        soft_bad_scores = 0
-        MAX_BAD_SCORES = 50
-        error_map_weight=0
 
-        # 1. Leinwand exakt EINMAL aufbauen!
+
+
+        # ====================================================================
+        # EMA Parameter
+        # ====================================================================
+        ema_score = None
+        patience_factor = 0.35  # Wir akzeptieren Formen, die mind. 35% so gut sind wie der Schnitt
+        self.spaghetti_unlocked = False
+        ema_negativ_reaction = 0.02
+        ema_positiv_reaction = 0.15
+        consecutive_bad_scores = 0
+        MAX_BAD_SCORES = 50 # Nach so vielen Versuchen wird auf Lokales maximum gesetzt
+        best_rejected_score = float('inf')
+
+
+
+
+        # ====================================================================
+        # Setup Leinwand
+        # ====================================================================
         self.target_img = self._load_target_image(self.resolution)
         self.canvas_img = self.mean_color.expand_as(self.target_img).clone()
         self.target_alpha = torch.ones(self.resolution, self.resolution, device=self.device)
@@ -117,12 +131,7 @@ class VectorRenderer:
         self.full_grid = GPUShapes.create_relative_grid(self.resolution, self.resolution, self.device)
 
 
-        filter_hard_limit = 0.0 #Abbruchbedingung für eine Phase
-        filter_soft_limit = 0.0 #Damit am Anfang einer Phase nur die Besten shapes gewählt werden
-        filter_soft_cooldown = 3
 
-        # NEU: Ein Speicher für die aktuelle Phase, um Rechenzeit zu sparen!
-        current_computed_phase = -1
 
         phase_score_sum = 0.0
         phase_shapes_accepted = 0
@@ -131,102 +140,71 @@ class VectorRenderer:
         while global_shapes_drawn < total_shapes_target:
 
             # ====================================================================
-            # PERFORMANCE-TRICK: Dieser Block läuft NUR 6-mal im ganzen Bild!
+            # PinselLogik
             # ====================================================================
-            if self.ema_pinsel != current_computed_phase:
-                current_computed_phase = self.ema_pinsel
 
-                phase_score_sum = 0.0
-                phase_shapes_accepted = 0
+            start_brush = 0.9
+            end_brush = 0.01
+            progress = global_shapes_drawn / total_shapes_target
 
-                # soft limit anhand der ersten shapes pro phase geschätzt
-                if self.ema_pinsel == 0:
-                    current_brush = 0.9
-                    filter_hard_limit = -10.0
-                    filter_soft_limit = -100
-                    error_map_weight= 0.1
-                elif self.ema_pinsel == 1:
-                    current_brush =  0.40
-                    filter_hard_limit = -10
-                    filter_soft_limit = -20
-                    error_map_weight=0.1
-                elif self.ema_pinsel == 2:
-                    current_brush = 0.20
-                    filter_hard_limit = -20.0
-                    filter_soft_limit = -75
-                    error_map_weight = 0.2
-                elif self.ema_pinsel == 3:
-                    current_brush =  0.10
-                    filter_hard_limit = -30.0
-                    filter_soft_limit = -200
-                    error_map_weight=0.5
-                elif self.ema_pinsel == 4:
-                    current_brush =  0.05
-                    filter_hard_limit = -50.0
-                    filter_soft_limit = -350
-                    error_map_weight = 0.6
-                elif self.ema_pinsel == 5:
-                    current_brush =  0.03
-                    filter_hard_limit = -65.0
-                    filter_soft_limit = -200
-                    error_map_weight = 0.75
-                elif self.ema_pinsel == 6:
-                    current_brush =  0.02
-                    filter_hard_limit = -50.0
-                    filter_soft_limit = -100
-                    error_map_weight = 0.8
-                elif self.ema_pinsel >= 7:
-                    current_brush =  0.01
-                    filter_hard_limit = -50.0
-                    filter_soft_limit = -50
-                    self.last_pinsel = True
-                    MAX_BAD_SCORES *= 2
-                    error_map_weight = 0.9
+            # HÄLT DEN PINSEL LÄNGER GROSS:
+            # adjusted_progress = math.pow(progress, 2.0)
+
+            # LÄSST DEN PINSEL SOFORT SCHRUMPFEN:
+            # adjusted_progress = math.pow(progress, 0.5)
+
+            current_max_s = start_brush * math.pow((end_brush / start_brush), progress)
+
+            # ErrorMap gewicht anpassen
+            error_map_weight = 0.1 + (0.8 * progress)
 
 
-                self._update_error_map(error_map_weight)
-                # In relatives Maß (0.0 bis 1.0) umwandeln
-                current_max_s = current_brush
+            # ====================================================================
+            # 2. DYNAMISCHES LIMIT (EMA-Filter)
+            # ====================================================================
+            if ema_score is None:
+                filter_hard_limit = 0.0  # Am Anfang alles erlauben
+            else:
+                filter_hard_limit = ema_score * patience_factor
 
-                patch_fov_px = (current_brush * 2.0 * float(self.resolution)) + 48.0
-                current_tile_size = int(math.ceil(patch_fov_px / 32.0) * 32)
-                current_tile_size = max(64, current_tile_size)
-                current_tile_size = min(128, current_tile_size)
+            # ====================================================================
+            # 3. KACHEL-GRÖSSE & UNTERGRENZEN
+            # ====================================================================
+            patch_fov_px = (current_max_s * 2.0 * float(self.resolution)) + 48.0
+            current_tile_size = max(64, min(128, int(math.ceil(patch_fov_px / 32.0) * 32)))
 
-                # 1. Das absolute GPU-Minimum (gegen Verschwinden der Form)
-                pixel_per_grid_cell = patch_fov_px / current_tile_size
-                absolute_min_px = max(2.0, pixel_per_grid_cell * 1.5)
-                gpu_safe_min_s = absolute_min_px / float(self.resolution)
+            # Das Klobig-Minimum (1/3) und das absolute GPU-Minimum (1.5 Pixel)
+            pixel_per_grid_cell = patch_fov_px / current_tile_size
+            gpu_safe_min_s = max(2.0, pixel_per_grid_cell * 1.5) / float(self.resolution)
+            chunky_min_s = current_max_s * 0.33
 
-                # 2. Das Klobig-Minimum (gegen Erbsen-Formen)
-                chunky_min_s = current_max_s * 0.33
+            # ====================================================================
+            # 4. DIE SPAGHETTI-ZANGE & MILESTONE-RESET
+            # ====================================================================
+            if progress < 0.5:
+                # Phase 1: Blockout (Beide Seiten klobig)
+                min_w = chunky_min_s
+                min_h = chunky_min_s
+            else:
+                # Phase 2: Details (Dicke darf auf 1.5 Pixel kollabieren)
+                min_w = chunky_min_s
+                min_h = gpu_safe_min_s
 
-                # --- NEU: ASYMMETRISCHE ZANGE ---
-                if self.ema_pinsel < 4:
-                    # Am Anfang: Beide Seiten müssen klobig sein
-                    min_w = chunky_min_s
-                    min_h = chunky_min_s
-                else:
-                    # Später: Die Länge (W) bleibt klobig, die Dicke (H) darf Spaghetti werden!
-                    min_w = chunky_min_s
-                    min_h = gpu_safe_min_s
+                # EMA-Reset beim Werkzeug-Wechsel!
+                if not self.spaghetti_unlocked:
+                    print("\n" + "=" * 60)
+                    print("SPAGHETTI MODE UNLOCKED!")
+                    print("Resette EMA-Score für Neu-Kalibrierung...")
+                    print("=" * 60 + "\n")
+                    ema_score = None
+                    self.spaghetti_unlocked = True
 
-                # Sicherheits-Check
-                min_w = min(min_w, current_max_s * 0.5)
-                min_h = min(min_h, current_max_s * 0.5)
+            min_w = min(min_w, current_max_s * 0.5)
+            min_h = min(min_h, current_max_s * 0.5)
 
-                # Wir übergeben jetzt ein ARRAY aus 2 Werten! Shape: (1, 2)
-                min_size_t = torch.tensor([[min_w, min_h]], device=self.device)
-                max_size_t = torch.tensor([[current_max_s, current_max_s]], device=self.device)
-
-                print(f"\n" + "=" * 75)
-                print(f"PHASE {self.ema_pinsel} | Limit: {filter_hard_limit}")
-                print(
-                    f"Pinsel Max: {current_max_s * self.resolution:>5.1f}px | Min Länge (W): {min_w * self.resolution:>5.1f}px | Min Dicke (H): {min_h * self.resolution:>5.1f}px")
-                print("=" * 75)
-                patch_fov_px_t = torch.tensor([patch_fov_px], device=self.device)
-
-
+            min_size_t = torch.tensor([[min_w, min_h]], device=self.device)
+            max_size_t = torch.tensor([[current_max_s, current_max_s]], device=self.device)
+            patch_fov_px_t = torch.tensor([patch_fov_px], device=self.device)
             # ====================================================================
             # ENGINE START
             # ====================================================================
@@ -242,64 +220,56 @@ class VectorRenderer:
                 top_k=top_k,
                 resolution=self.resolution,
                 heat_map=self.flat_error_map,
-                alpha_base=min(current_brush,0.5)
+                alpha_base=min(current_max_s,0.5)
             )
             shape_type = int(best_params[6].item())
 
             # ====================================================================
-            # SOFT-FILTER
-            # ====================================================================
-
-            if (use_soft_filter and
-                     best_score > filter_soft_limit and filter_soft_limit < filter_hard_limit ):
-                soft_bad_scores +=1
-                if soft_bad_scores < filter_soft_cooldown:
-                    continue
-                else:
-                    filter_soft_limit *= 0.90
-                    print(f"Filter soft limit {filter_soft_limit:1f}")
-                    continue
-
-
-            # ====================================================================
-            # HARD-FILTER & PHASEN-WECHSEL
+            # FILTER (REJECTION SAMPLING)
             # ====================================================================
             if best_score > filter_hard_limit:
                 consecutive_bad_scores += 1
-                if consecutive_bad_scores % 25 == 0 or consecutive_bad_scores == 1:
-                    print(f"    Filter Limit {consecutive_bad_scores*2}%")
 
+                if best_score < best_rejected_score:
+                    best_rejected_score = best_score
+                # Wenn wir absolut feststecken (z.B. 50x in Folge Müll gefunden),
+                # weichen wir den Maßstab auf bestes der letzten 50
                 if consecutive_bad_scores > MAX_BAD_SCORES:
+                    if ema_score is not None:
+                        ema_score = best_rejected_score
                     consecutive_bad_scores = 0
-                    soft_bad_scores = 0
-                    if phase_shapes_accepted > 0:
-                        avg_score = phase_score_sum / phase_shapes_accepted
-                        print(f"Phase {self.ema_pinsel} abgeschlossen! | Akzeptierte Formen: {phase_shapes_accepted} | Ø-Score: {avg_score:.2f}")
+                    best_rejected_score = float('inf') #speicher für lokales maximum zurücksetzen
+                    print(f"    [Warnung] Stecke fest! EMA-Limit auf {ema_score} gesetzt.")
 
-                    if self.last_pinsel:
-                        print(f"Bild ist nach {global_shapes_drawn} Formen fertig (Letzter Pinsel ausgereizt).")
-                        if phase_shapes_accepted > 0:
-                            avg_score = phase_score_sum / phase_shapes_accepted
-                            print(
-                                f"Phase {self.ema_pinsel} abgeschlossen! | Akzeptierte Formen: {phase_shapes_accepted} | Ø-Score: {avg_score:.2f}")
-                        break
-
-                    # Phase erhöhen! Durch den Trick oben wird im nächsten Durchlauf
-                    # die Mathematik exakt einmal neu berechnet.
-                    self.ema_pinsel += 1
-
-                continue
+                continue  #Form wegwerfen
 
             # ====================================================================
-            # ERFOLG - FORM EINBRENNEN
+            # Erfolg - Filter Anpassen
             # ====================================================================
             consecutive_bad_scores = math.ceil(consecutive_bad_scores / 2)
-            soft_bad_scores = 0
             global_shapes_drawn += 1
+            best_rejected_score = float('inf')  # speicher für lokales maximum zurücksetzen
+
+            # --- NEU: Asymmetrisches EMA Update ---
+            if ema_score is None:
+                ema_score = best_score
+            else:
+                # WICHTIG: best_score ist negativ. Ein kleinerer Wert (z.B. -200) ist BESSER als -50.
+                if best_score < ema_score:
+                    # GIERIG: Wir haben eine super Form gefunden! Standard schnell anheben.
+                    ema_score = ((1- ema_positiv_reaction) * ema_score) + (ema_positiv_reaction * best_score)
+                else:
+                    # ZÖGERLICH: Form war schlechter als der Schnitt. Standard nur extrem langsam senken.
+                    ema_score = ((1-ema_negativ_reaction) * ema_score) + (ema_negativ_reaction * best_score)
+
+
+            # ====================================================================
+            # FORM EINBRENNEN
+            # ====================================================================
 
             if global_shapes_drawn % 100 == 0:
                 self._update_error_map(error_map_weight)
-                print("    [Info] Error Map für Importance Sampling aktualisiert.")
+
 
             phase_score_sum += best_score
             phase_shapes_accepted += 1
@@ -311,7 +281,8 @@ class VectorRenderer:
             # OpenCV Live Vorschau
             if global_shapes_drawn % preview_interval == 0 or global_shapes_drawn == 1:
                 self._show_preview(self.canvas_img, "Vector Renderer - Live Preview")
-                print(f"    Form {global_shapes_drawn:>4}/{total_shapes_target}  | Score: {best_score:.2f}")
+                print(f"    Form {global_shapes_drawn:>4}/{total_shapes_target}  | Score: {best_score:.2f}"
+                      f"| EMA: {ema_score:.2f}")
             if global_shapes_drawn >= total_shapes_target:
 
                 print(f"Ziel-Budget von {total_shapes_target} Formen erreicht! Beende Rendering.")
