@@ -3,6 +3,7 @@ import time
 import torch
 import torchvision.transforms.functional as TF
 
+from cpuUtils import filter_top_shapes
 from profil import RenderPreset
 
 torch._dynamo.config.cache_size_limit = 64
@@ -14,8 +15,15 @@ import cv2
 import numpy as np
 from OptimizerEngine import OptimizerEngine
 from GPUShapes import GPUShapes
+import logging
+import torch._logging
+torch._logging.set_logs(
+    dynamo=logging.WARNING,
 
-
+    # Die beiden WICHTIGSTEN Logs für dich:
+    graph_breaks=True,  # Warnt dich, wenn er die Optimierung abbrechen muss (z.B. wegen In-Place Operationen)
+    recompiles=True  # Warnt dich, wenn er neu kompilieren muss (weil sich die Input-Größe unerwartet geändert hat)
+)
 class VectorRenderer:
     def __init__(self, image_path, device=None):
         self.telemetry_data = []
@@ -100,7 +108,7 @@ class VectorRenderer:
 
     # Füge die Pinselgrößen (min_brush_px, max_brush_px) als Argumente hinzu
     def render(self,preset: RenderPreset ,preview_interval=10, total_shapes_target=2000, telemetry = False,
-               wait_at_finisch=True):
+               wait_at_finisch=True,max_shapes_per_iteration=3):
 
         cfg = preset.value
 
@@ -142,11 +150,6 @@ class VectorRenderer:
 
 
 
-        phase_score_sum = 0.0
-        phase_shapes_accepted = 0
-
-
-
         # 2. Die EINE saubere Render-Schleife
         while global_shapes_drawn < total_shapes_target:
 
@@ -168,15 +171,6 @@ class VectorRenderer:
 
             # ErrorMap gewicht anpassen
             error_map_weight = min(0.4 + (0.7 * progress), 0.9)
-
-
-            # ====================================================================
-            # 2. DYNAMISCHES LIMIT (EMA-Filter)
-            # ====================================================================
-            if ema_score is None:
-                filter_hard_limit = 0.0  # Am Anfang alles erlauben
-            else:
-                filter_hard_limit = ema_score * patience_factor
 
             # ====================================================================
             # 3. KACHEL-GRÖSSE & UNTERGRENZEN
@@ -220,9 +214,31 @@ class VectorRenderer:
             # ====================================================================
             # ENGINE START
             # ====================================================================
-            best_params, best_color, best_score = OptimizerEngine.find_best_shape(
-                self.target_img, self.canvas_img, self.target_alpha,
-                n_samples=1024 * cfg["sample_multi"],
+
+            # Generate Samples
+            num_samples = 1024 * cfg["sample_multi"]
+
+            # 1. POSITIONEN GENERIEREN (Heatmap oder Random)
+            if self.flat_error_map is None:
+                # Am Anfang (ohne Error-Map) einfach zufällig über das Bild verteilen
+                random_samples = torch.rand((num_samples, 2), device=self.device)
+            else:
+                # Sampling basierend auf der Error-Map! (Wahrscheinlichkeitsverteilung)
+                sampled_indices = torch.multinomial(self.flat_error_map, num_samples=num_samples, replacement=True)
+
+                # Indices zurück in X und Y Koordinaten (0.0 bis 1.0) umrechnen
+                pos_y = (sampled_indices // self.resolution).float() / self.resolution
+                pos_x = (sampled_indices % self.resolution).float() / self.resolution
+
+                # Zu (N, 2) Tensor stacken
+                random_samples = torch.stack((pos_x, pos_y), dim=1)
+
+            best_params, best_color, best_score = None, None, None
+            elite_tensor = OptimizerEngine.find_best_shape(
+                target_img=self.target_img,
+                canvas_img=self.canvas_img,
+                random_samples=random_samples,
+                target_alpha=self.target_alpha,
                 n_mutate=cfg["n_mutate"],
                 min_size=min_size_t,
                 max_size=max_size_t,
@@ -231,95 +247,128 @@ class VectorRenderer:
                 patch_fov_px=patch_fov_px_t,
                 top_k=cfg["top_k"],
                 resolution=self.resolution,
-                heat_map=self.flat_error_map,
                 alpha_base=min(current_max_s, 0.5)
             )
-            shape_type = int(best_params[6].item())
+            elite_shapes = elite_tensor.detach().cpu().numpy()
+
+            # ====================================================================
+            # DYNAMISCHES LIMIT (EMA-Filter)
+            # ====================================================================
+            if ema_score is None:
+                filter_hard_limit = None  # Signal an cpuUtils: Nichts filtern!
+                current_max_return = 1  # WICHTIG: Am Anfang nur exakt 1 Form zulassen, um die Baseline zu setzen
+            else:
+                filter_hard_limit = ema_score * patience_factor
+                current_max_return = max_shapes_per_iteration  # Wenn der Filter läuft, dürfen es auch 3 gleichzeitig sein
+
+            final_shapes = filter_top_shapes(elites_tensor=elite_shapes,
+                                             max_return_shapes=current_max_return,
+                                             filter_hard_limit=filter_hard_limit,
+                                             overlap_margin=0.95
+                                             )
+
 
             # ====================================================================
             # FILTER (REJECTION SAMPLING)
             # ====================================================================
-            if best_score > filter_hard_limit:
+            if len(final_shapes) == 0:
                 consecutive_bad_scores += 1
                 bad_shapes_count+=1
-                if best_score < best_rejected_score:
-                    best_rejected_score = best_score
-                # Wenn wir absolut feststecken (z.B. 50x in Folge Müll gefunden),
-                # weichen wir den Maßstab auf bestes der letzten 50
+                best_rejected_candidate = elite_shapes[0, 10].item()
+
+                if best_rejected_candidate < best_rejected_score:
+                    best_rejected_score = best_rejected_candidate
+
                 if consecutive_bad_scores > MAX_BAD_SCORES:
                     if ema_score is not None:
                         ema_score = best_rejected_score
                     consecutive_bad_scores = 0
                     best_rejected_score = float('inf') #speicher für lokales maximum zurücksetzen
-                    print(f"    [Warnung] Stecke fest! EMA-Limit auf {ema_score} gesetzt.")
-
-                if telemetry:
-                    # Wir zwingen best_score und ema_score explizit zu normalen Floats
-                    s = float(best_score)
-                    e = float(ema_score) if ema_score is not None else None
-                    self.deleted_scores.append([s, e])
                 continue  #Form wegwerfen
 
             # ====================================================================
             # Erfolg - Filter Anpassen
             # ====================================================================
             consecutive_bad_scores = math.ceil(consecutive_bad_scores / 2)
-            global_shapes_drawn += 1
             best_rejected_score = float('inf')  # speicher für lokales maximum zurücksetzen
-
-            # --- NEU: Asymmetrisches EMA Update ---
-            if ema_score is None:
-                if first_ema_score:
-                    first_ema_score = False
-                    ema_score = None
-                else:
-                    ema_score = best_score
-            else:
-                # WICHTIG: best_score ist negativ. Ein kleinerer Wert (z.B. -200) ist BESSER als -50.
-                if best_score < ema_score:
-                    # GIERIG: Wir haben eine super Form gefunden! Standard schnell anheben.
-                    ema_score = ((1- ema_positiv_reaction) * ema_score) + (ema_positiv_reaction * best_score)
-                else:
-                    # ZÖGERLICH: Form war schlechter als der Schnitt. Standard nur extrem langsam senken.
-                    ema_score = ((1-ema_negativ_reaction) * ema_score) + (ema_negativ_reaction * best_score)
+            mean_batch_score = None
+            for shape_data in final_shapes:
 
 
+
+                # Abbruch-Bedingung prüfen
+                if global_shapes_drawn >= total_shapes_target:
+                    print(f"\nZiel-Budget von {total_shapes_target} Formen erreicht! Beende Rendering.")
+
+                    # Sicherer Prozent-Rechner (verhindert Division by Zero)
+                    total_attempts = total_shapes_target + bad_shapes_count
+                    reject_rate = (bad_shapes_count / total_attempts * 100) if total_attempts > 0 else 0.0
+
+                    print(f"{bad_shapes_count} Shapes weggeworfen. ({reject_rate:.2f}% Rejection Rate)")
+                    break  # Bricht die for-Schleife ab. Die äußere while-Schleife beendet sich danach automatisch.
+
+
+
+                # ====================================================================
+                # TELEMETRIE & LOGGING (Innerhalb der for-Schleife!)
+                # ====================================================================
+                if telemetry:
+                    self.telemetry_data.append({
+                        "geometry": best_params.cpu().tolist(),
+                        # <-- GEFIXT: Nutzt jetzt best_params (alle 7 Werte)
+                        "score": float(best_score),
+                        "ema": float(ema_score) if ema_score is not None else 0.0,
+                        "pinsel_max": float(current_max_s),
+                        "color": best_color.cpu().tolist(),  # <-- GEFIXT: Das hat schon gepasst
+                        "shape_type": shape_type,
+                    })
+
+            best_params = torch.tensor(shape_data[:7], device=self.device)
+            best_color = torch.tensor(shape_data[7:10], device=self.device)
+            # ====================================================================
+            # EMA score agg
+            # ====================================================================
+
+            batch_scores = [s[10] for s in final_shapes]
+            mean_batch_score = sum(batch_scores) / len(batch_scores)
+
+            best_score = shape_data[10]
+            shape_type = int(shape_data[11])
+
+            global_shapes_drawn += 1
+
+            # --- GANZ SAUBERES EMA UPDATE ---
+            if ema_score is not None:
+                # OpenCV Live Vorschau
+                if global_shapes_drawn % preview_interval == 0:
+                    self._show_preview(self.canvas_img, "Vector Renderer - Live Preview")
+                    if ema_score is not None:
+                        print(
+                            f"    Form {global_shapes_drawn:>4}/{total_shapes_target}  | Score: {best_score:.2f} "
+                            f"| EMA: {ema_score:.2f} | PinselMax: {current_max_s:.4f}")
             # ====================================================================
             # FORM EINBRENNEN
             # ====================================================================
 
-            if global_shapes_drawn % 100 == 0:
-                self._update_error_map(error_map_weight)
+
+                if global_shapes_drawn % 100 == 0:
+                    self._update_error_map(error_map_weight)
 
 
-            phase_score_sum += best_score
-            phase_shapes_accepted += 1
+            self._update_canvas(best_params, best_color, shape_type)
+            self._save_to_memory(best_params, best_color, shape_type)
 
-            geom_only_final = best_params[:6]
-            self._update_canvas(geom_only_final, best_color, shape_type)
-            self._save_to_memory(geom_only_final, best_color, shape_type)
+            # ====================================================================
+            # UPDATE EMA
+            # ====================================================================
+            if ema_score is None:
+                ema_score = mean_batch_score  # Der Startschuss!
+            else:
+                if mean_batch_score < ema_score:
+                    ema_score = ((1 - ema_positiv_reaction) * ema_score) + (ema_positiv_reaction * mean_batch_score)
+                else:
+                    ema_score = ((1 - ema_negativ_reaction) * ema_score) + (ema_negativ_reaction * mean_batch_score)
 
-            # OpenCV Live Vorschau
-            if global_shapes_drawn % preview_interval == 0:
-                self._show_preview(self.canvas_img, "Vector Renderer - Live Preview")
-                if ema_score is not None:
-                    print(f"    Form {global_shapes_drawn:>4}/{total_shapes_target}  | Score: {best_score:.2f}"
-                      f"| EMA: {ema_score:.2f} | PinselMax: {current_max_s}")
-            if global_shapes_drawn >= total_shapes_target:
-
-                print(f"Ziel-Budget von {total_shapes_target} Formen erreicht! Beende Rendering.")
-                print(f"{bad_shapes_count} Shapes Weg geworfen. ({bad_shapes_count/(total_shapes_target+bad_shapes_count)*100:.2f}%)")
-                break
-
-            if telemetry:
-                self.telemetry_data.append({
-                    "geometry": geom_only_final.cpu().tolist(),  # <-- HIER FIXEN
-                    "score": float(best_score),
-                    "ema": float(ema_score) if ema_score is not None else 0.0,
-                    "pinsel_max": float(current_max_s),
-                    "color": best_color.cpu().tolist(),  # <-- HIER FIXEN
-                    "shape_type": shape_type,
-                })
 
         if wait_at_finisch:
             cv2.waitKey()
@@ -339,24 +388,24 @@ class VectorRenderer:
         cv2.imshow(window_name, display_img_2)
         cv2.waitKey(1)
 
-
-
-
     def _update_canvas(self, params: torch.Tensor, color: torch.Tensor, shape_type: int):
         with torch.no_grad():
             grid = self.full_grid
             params_exp = params.unsqueeze(0)
 
-            if shape_type == 0:
-                sdfs = GPUShapes.sdf_ellipse(grid.unsqueeze(0), params_exp)
-            elif shape_type == 1:
-                sdfs = GPUShapes.sdf_rectangle(grid.unsqueeze(0), params_exp)
-            else:
-                sdfs = GPUShapes.sdf_triangle(grid.unsqueeze(0), params_exp)
+            math_params = params_exp[:, :6]
 
-            mask  = torch.sigmoid(-sdfs * 1000.0)
+            if shape_type == 0:
+                sdfs = GPUShapes.sdf_ellipse(grid.unsqueeze(0), math_params)
+            elif shape_type == 1:
+                sdfs = GPUShapes.sdf_rectangle(grid.unsqueeze(0), math_params)
+            else:
+                sdfs = GPUShapes.sdf_triangle(grid.unsqueeze(0), math_params)
+
+            mask = torch.sigmoid(-sdfs * 1000.0)
             color_exp = color.view(3, 1, 1)
-            effective_alpha = mask * params[5]
+
+            effective_alpha = mask * params[6]
 
             self.canvas_img = (color_exp * effective_alpha) + (self.canvas_img * (1.0 - effective_alpha))
 
@@ -379,7 +428,8 @@ class VectorRenderer:
             "rw": p_list[2],
             "rh": p_list[3],
             "angle": p_list[4] * (180.0 / math.pi),  # Bogenmaß zurück in Grad
-            "alpha": p_list[5],
+            "skew": p_list[5],
+            "alpha": p_list[6],
             "color": [
                 int(c_list[0] * 255),
                 int(c_list[1] * 255),
@@ -440,12 +490,14 @@ if __name__ == "__main__":
 
     # 10er Intervalle für das Live-Fenster sind angenehm flüssig
     time_start = time.time()
+    preset=RenderPreset.FAST
     renderer.render(
-        preset=RenderPreset.ULTRA_FAST,
-        preview_interval=1,
-        total_shapes_target=3000,
-        telemetry=True,
-        wait_at_finisch=False
+        preset=preset,
+        preview_interval=100,
+        total_shapes_target=500,
+        telemetry=False,
+        wait_at_finisch=False,
+        max_shapes_per_iteration = preset.value["max_shapes_per_iteration"],
     )
     time_end = time.time()
     print(f"Dauer: {time_end - time_start}")

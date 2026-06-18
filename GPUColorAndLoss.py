@@ -47,7 +47,7 @@ class GPUColorAndLoss:
 
     @staticmethod
     @torch.compile(fullgraph=True)
-    def compute_score(blended_tile, target_tile, target_alpha_tile, canvas_tile, mask, alpha, params):
+    def compute_score(blended_tile, target_tile, target_alpha_tile, canvas_tile, mask, alpha):
         B = mask.shape[0]
 
         # ==========================================================

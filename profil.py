@@ -25,10 +25,11 @@ class RenderPreset(Enum):
         "ema_negativ_reaction": 0.02,
         "pinsel_steilheit": 0.50,
         "n_mutate": 16,
-        "top_k": 12,
+        "top_k": 16,
         "sample_multi": 2,
         "batch_multi": 1,
-        "resolution": 1024
+        "resolution": 1024,
+        "max_shapes_per_iteration":6
     }
 
     # --- LEVEL 3: NORMAL (Der Sweet-Spot) ---
@@ -40,10 +41,11 @@ class RenderPreset(Enum):
         "ema_negativ_reaction": 0.01,
         "pinsel_steilheit": 0.60,      # Deine gesunde Standard-Kurve
         "n_mutate": 32,
-        "top_k": 24,
+        "top_k": 32,
         "sample_multi": 4,
         "batch_multi": 2,
-        "resolution": 2048
+        "resolution": 2048,
+        "max_shapes_per_iteration":12
     }
 
     # --- LEVEL 4: HOCH ---
