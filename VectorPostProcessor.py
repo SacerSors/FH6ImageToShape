@@ -41,10 +41,12 @@ class VectorPostProcessor:
             with torch.no_grad():
                 if shape_type == 0:
                     sdfs = GPUShapes.sdf_ellipse(grid, params)
+                if shape_type == 1:
+                    sdfs = GPUShapes.sdf_rectangle(grid, params)
                 else:
                     sdfs = GPUShapes.sdf_triangle(grid, params)
 
-                mask = torch.sigmoid(-sdfs * 100.0)
+                mask = (sdfs <= 0.0).float()
                 eff_opacity = mask * shape["alpha"]
 
                 visible_contribution = eff_opacity * visibility_map
@@ -96,7 +98,7 @@ class VectorPostProcessor:
                 else:
                     sdfs = GPUShapes.sdf_triangle(grid, params)
 
-                mask = torch.sigmoid(-sdfs * 100.0).squeeze(0)
+                mask = (sdfs <= 0.0).float()
                 effective_alpha = mask * shape["alpha"]
 
                 canvas_img = (color * effective_alpha) + (canvas_img * (1.0 - effective_alpha))
@@ -105,7 +107,7 @@ class VectorPostProcessor:
             if (i + 1) % preview_interval == 0 or i == len(vector_data) - 1:
                 np_img = (canvas_img.permute(1, 2, 0).cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
                 bgr_img = cv2.cvtColor(np_img, cv2.COLOR_RGB2BGR)
-                display_img = cv2.resize(bgr_img, (512, 512), interpolation=cv2.INTER_AREA)
+                display_img = cv2.resize(bgr_img, (resolution, resolution), interpolation=cv2.INTER_AREA)
 
                 cv2.imshow("Vector Pruning - Live Preview", display_img)
                 cv2.waitKey(1)  # Kurzer Stop, damit das Fenster updatet
@@ -117,9 +119,9 @@ class VectorPostProcessor:
 
 if __name__ == "__main__":
     # === EINSTELLUNGEN ===
-    INPUT_JSON = "bilder/frieren_vektor_2.json"  # Deine rohe Render-Datei
-    OUTPUT_JSON = "frieren_pruned.json"  # Die neue, gesäuberte Datei
-    THRESHOLD = 0.0  # %-Einfluss (Höher = mehr Formen werden gelöscht)
+    INPUT_JSON = "frierenHeart.json"  # Deine rohe Render-Datei
+    OUTPUT_JSON = "frierenHeart_purn.json"  # Die neue, gesäuberte Datei
+    THRESHOLD = 0  # %-Einfluss (Höher = mehr Formen werden gelöscht)
     PREVIEW_INTERVAL = 25  # Alle X Formen das Bild updaten
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -134,7 +136,7 @@ if __name__ == "__main__":
     # 2. Pruning (Der Gärtner-Lauf)
     cleaned_shapes = VectorPostProcessor.prune_shapes(
         vector_data=raw_shapes,
-        resolution=1024,
+        resolution=4096,
         threshold_percent=THRESHOLD,
         device=DEVICE
     )

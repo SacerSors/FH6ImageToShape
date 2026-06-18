@@ -33,10 +33,10 @@ class TestGPUShapes:
         sdf_rect = GPUShapes.sdf_rectangle(grid, params_rect)[0]
         sdf_tri = GPUShapes.sdf_triangle(grid, params_tri)[0]
 
-        # 4. Masken via Sigmoid generieren (mit negativer SDF, damit innen = 1.0)
-        mask_ellipse = torch.sigmoid(-sdf_ellipse * sharpness)
-        mask_rect = torch.sigmoid(-sdf_rect * sharpness)
-        mask_tri = torch.sigmoid(-sdf_tri * sharpness)
+        # 4. Masken via SDF generieren (mit negativer SDF, damit innen = 1.0)
+        mask_ellipse = (sdf_ellipse <= 0.0).float()
+        mask_rect = (sdf_rect <= 0.0).float()
+        mask_tri = (sdf_tri <= 0.0).float()
 
         # 5. Plotten mit Matplotlib
         TestGPUShapes._plot_results(
