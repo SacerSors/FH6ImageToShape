@@ -1,7 +1,9 @@
+import random
 import time
 
 import torch
 import torchvision.transforms.functional as TF
+from math import ceil
 
 from cpuUtils import filter_top_shapes
 from profil import RenderPreset
@@ -37,6 +39,7 @@ class VectorRenderer:
         self.flat_error_map = None
         self.device = torch.device(device if device else ('cuda' if torch.cuda.is_available() else 'cpu'))
         self.image_path = image_path
+        self.all_samples = []
 
 
         # Globale Vektor-Liste (Hier liegt unser eigentliches "Meisterwerk")
@@ -70,6 +73,209 @@ class VectorRenderer:
         self.resolution = 0
         self.target_img = None
         self.canvas_img = None
+
+    def _build_static_grid(self, current_max_s):
+        """
+        Baut das statische Bucket-Grid für die aktuelle Detailstufe (LOD).
+        Wird nur aufgerufen, wenn der Pinsel signifikant kleiner wird.
+        """
+        brush_px = current_max_s * self.resolution
+
+        # 1. Kachel-Größe bestimmen (Kernbereich)
+        # Wir runden auf 32er Schritte. Max 1/4 des Bildes, Min 32 Pixel.
+        raw_core = max(32, min(self.resolution // 4, int(brush_px * 2)))
+        core_size = math.ceil(raw_core / 64) * 64
+
+        stride = core_size // 2  # 50% Überlappung
+
+        # 2. Das FOV für die GPU (Kern + Pinselüberhang)
+        # Das ist exakt die Breite/Höhe in Pixeln, die wir aus dem großen Bild schneiden.
+        buffer_padding = math.ceil(brush_px * 1.42) + 4
+        patch_fov_px = core_size + (2 * buffer_padding)
+
+        buckets = []
+        bucket_id = 0
+
+        # 3. Grid über das Bild legen
+        for y in range(0, self.resolution - stride, stride):
+            for x in range(0, self.resolution - stride, stride):
+
+                # --- A: KERNBEREICH (Für die Spawns der cx, cy) ---
+                x_start, y_start = x, y
+                x_end = min(x + core_size, self.resolution)
+                y_end = min(y + core_size, self.resolution)
+
+                # Wenn der Kernbereich am Rand winzig wird (kleiner als 16px), überspringen wir ihn
+                if (x_end - x_start) < 16 or (y_end - y_start) < 16:
+                    continue
+
+                # --- B: GPU BERECHNUNGEN (Das FOV-Zentrum) ---
+                # Die GPU braucht für theta (affine_grid) das genaue Zentrum des Buffers.
+                # WICHTIG: Das Zentrum des Buffers ist das Zentrum des Kerns!
+                center_x_px = x_start + (core_size / 2.0)
+                center_y_px = y_start + (core_size / 2.0)
+
+                # Umrechnen in -1.0 bis +1.0 für PyTorch grid_sample
+                # 0px -> -1.0 | resolution -> +1.0
+                tx = (center_x_px / self.resolution) * 2.0 - 1.0
+                ty = (center_y_px / self.resolution) * 2.0 - 1.0
+
+                buckets.append({
+                    "id": bucket_id,
+                    "core_x_start": x_start,
+                    "core_x_end": x_end,
+                    "core_y_start": y_start,
+                    "core_y_end": y_end,
+                    "gpu_tx": tx,  # Perfekt vorbereitet für die GPU!
+                    "gpu_ty": ty,  # Perfekt vorbereitet für die GPU!
+                    "shape_count": 0,
+
+                })
+                bucket_id += 1
+
+        # Wir merken uns das aktuelle Grid und die FOV-Größe in der Klasse
+        self.active_grid = buckets
+        self.active_fov_px = patch_fov_px
+        self.active_core_size = core_size
+
+        print(
+            f"\n[LOD Update] Pinsel: {brush_px:.1f}px | Core: {core_size}px | FOV: {patch_fov_px}px | Buckets: {len(buckets)}")
+
+
+
+    """
+    bucket_tiers ist ein dickt mit 4 tier stufen finisched, low, normal, high.
+    jede dieser stufen ist None oder eine liste mit den zu stufe gehörenden bucket IDs
+    
+    buckets_per_it muss durch 4 Teilbar sein
+    samples_per_it und buckets_per_it mussen ein verhltnis von:
+        samples_per_it = n * samples_per_it * 8
+    
+    """
+
+    def _generate_samples_from_buckets(self, bucket_tiers: dict, buckets_per_it:int, samples_per_it:int):
+        if bucket_tiers is None:
+            bucket_tiers = {"normal": range(len(self.active_grid))}
+
+        high_buckets = bucket_tiers.get("high", [])
+        normal_buckets = bucket_tiers.get("normal", [])
+        low_buckets = bucket_tiers.get("low", [])
+
+        target_high = buckets_per_it //2
+        target_normal = buckets_per_it //4
+        target_low = buckets_per_it //4
+
+        # HIGH auswerten & Überlauf berechnen
+        high_count = min(target_high, len(high_buckets))
+        leftover_high = target_high - high_count
+
+        # NORMAL auswerten (Bekommt den Rest von HIGH)
+        target_normal += leftover_high
+        normal_count = min(target_normal, len(normal_buckets))
+        leftover_normal = target_normal - normal_count
+
+        # LOW auswerten (Bekommt den Rest von NORMAL)
+        target_low += leftover_normal
+        low_count = min(target_low, len(low_buckets))
+
+        # 2. Buckets zufällig ziehen
+        selected_high = random.sample(high_buckets, high_count)
+        selected_normal = random.sample(normal_buckets, normal_count)
+        selected_low = random.sample(low_buckets, low_count)
+
+        # 3. Wir nutzen eine lokale Liste statt self.all_samples (sauberer)
+        all_samples_tensors = []
+
+        budget_h, budget_m, budget_l = self.calculate_attention(buckets_per_it, samples_per_it)
+
+        # 4. Samples generieren (mit den richtigen Variablen!)
+        all_samples_tensors.extend(self.generate_samples(budget_h, selected_high))
+        all_samples_tensors.extend(self.generate_samples(budget_m, selected_normal))
+        all_samples_tensors.extend(self.generate_samples(budget_l, selected_low))
+
+        # Wenn gar keine Buckets gefunden wurden (Ende des Bildes)
+        if not all_samples_tensors:
+            return None, None
+
+        # 5. Alles zu einem einzigen (N, 5) Tensor zusammenkleben
+        final_samples_tensor = torch.cat(all_samples_tensors, dim=0)
+
+        # Das Paket für die GPU schnüren
+        active_bucket_count = high_count + normal_count + low_count
+        gpu_package = {
+            "patch_fov_px": self.active_fov_px,
+            "b_count": active_bucket_count
+        }
+
+        return final_samples_tensor, gpu_package
+
+    def generate_samples(self, budget: int, selected_buckets: list[int]):
+        """Generiert die Tensoren für eine Liste von Buckets hoch-vektorisiert ohne Python-Loop!"""
+        if budget <= 0 or not selected_buckets:
+            return []
+
+        num_buckets = len(selected_buckets)
+        total_samples = num_buckets * budget
+
+        # 1. Daten aus dem Dictionary flachklopfen (Harmlose Python-Listen)
+        x_starts = [self.active_grid[b]["core_x_start"] for b in selected_buckets]
+        x_ends   = [self.active_grid[b]["core_x_end"] for b in selected_buckets]
+        y_starts = [self.active_grid[b]["core_y_start"] for b in selected_buckets]
+        y_ends   = [self.active_grid[b]["core_y_end"] for b in selected_buckets]
+        b_ids    = [self.active_grid[b]["id"] for b in selected_buckets]
+        txs      = [self.active_grid[b]["gpu_tx"] for b in selected_buckets]
+        tys      = [self.active_grid[b]["gpu_ty"] for b in selected_buckets]
+
+        # 2. In EINEN einzigen Tensor auf der GPU werfen und direkt auf das Budget "aufblasen"
+        # repeat_interleave macht aus [A, B] bei budget=3 -> [A, A, A, B, B, B]
+        x_s_t = torch.tensor(x_starts, device=self.device, dtype=torch.float32).repeat_interleave(budget)
+        x_e_t = torch.tensor(x_ends, device=self.device, dtype=torch.float32).repeat_interleave(budget)
+        y_s_t = torch.tensor(y_starts, device=self.device, dtype=torch.float32).repeat_interleave(budget)
+        y_e_t = torch.tensor(y_ends, device=self.device, dtype=torch.float32).repeat_interleave(budget)
+        b_id_t = torch.tensor(b_ids, device=self.device, dtype=torch.float32).repeat_interleave(budget)
+        tx_t = torch.tensor(txs, device=self.device, dtype=torch.float32).repeat_interleave(budget)
+        ty_t = torch.tensor(tys, device=self.device, dtype=torch.float32).repeat_interleave(budget)
+
+        # 3. Exakt ZWEI Random-Aufrufe statt Hunderter!
+        rand_x = (torch.rand(total_samples, device=self.device) * (x_e_t - x_s_t) + x_s_t) / float(self.resolution)
+        rand_y = (torch.rand(total_samples, device=self.device) * (y_e_t - y_s_t) + y_s_t) / float(self.resolution)
+
+        # 4. Relative Grenzen berechnen (alles Vektor-Mathe!)
+        t_xmin = x_s_t / float(self.resolution)
+        t_xmax = x_e_t / float(self.resolution)
+        t_ymin = y_s_t / float(self.resolution)
+        t_ymax = y_e_t / float(self.resolution)
+
+        # 5. Ein einziger GPU-Stack-Befehl
+        bucket_tensor = torch.stack((rand_x, rand_y, b_id_t, tx_t, ty_t, t_xmin, t_xmax, t_ymin, t_ymax), dim=1)
+
+        return [bucket_tensor]
+
+    def calculate_attention(self, total_objects, total_attention):
+        # 1. Objekte auf Tiers verteilen (50%, 25%, 25%)
+        target_high = total_objects // 2
+        target_normal = total_objects // 4
+        target_low = total_objects // 4
+
+        # 2. Die relativen Gewichte festlegen (abgeleitet von 26, 8, 4)
+        weight_high = 13
+        weight_normal = 4
+        weight_low = 2
+
+        # 3. Berechnen der gewichteten Gesamtsumme
+        weighted_sum = (target_high * weight_high) + \
+                       (target_normal * weight_normal) + \
+                       (target_low * weight_low)
+
+        # 4. Den Basiswert ermitteln
+        base_unit = total_attention / weighted_sum
+
+        # 5. Die finale Punkteverteilung pro Objekt ermitteln
+        attention_high = base_unit * weight_high
+        attention_normal = base_unit * weight_normal
+        attention_low = base_unit * weight_low
+
+        return int(attention_high), int(attention_normal), int(attention_low)
 
     def _load_target_image(self, resolution, blur_radius=0):
         """Lädt das Bild und verschmiert es (blinzeln) für grobe LODs!"""
@@ -169,6 +375,14 @@ class VectorRenderer:
             adjusted_progress = math.pow(progress, cfg["pinsel_steilheit"])
             current_max_s = start_brush * math.pow((end_brush / start_brush), adjusted_progress)
 
+            # ====================================================================
+            # GRID UPDATE LOGIK
+            # ====================================================================
+            # Wir bauen das Grid nur am Anfang ODER wenn der Pinsel 20% kleiner geworden ist
+            if not hasattr(self, 'last_grid_brush') or current_max_s < self.last_grid_brush * 0.8:
+                self._build_static_grid(current_max_s)
+                self.last_grid_brush = current_max_s
+
             # ErrorMap gewicht anpassen
             error_map_weight = min(0.4 + (0.7 * progress), 0.9)
 
@@ -215,29 +429,24 @@ class VectorRenderer:
             # ENGINE START
             # ====================================================================
 
-            # Generate Samples
             num_samples = 1024 * cfg["sample_multi"]
 
             # 1. POSITIONEN GENERIEREN (Heatmap oder Random)
-            if self.flat_error_map is None:
-                # Am Anfang (ohne Error-Map) einfach zufällig über das Bild verteilen
-                random_samples = torch.rand((num_samples, 2), device=self.device)
-            else:
-                # Sampling basierend auf der Error-Map! (Wahrscheinlichkeitsverteilung)
-                sampled_indices = torch.multinomial(self.flat_error_map, num_samples=num_samples, replacement=True)
+            final_samples_tensor, gpu_package = self._generate_samples_from_buckets(
+                bucket_tiers=None,
+                buckets_per_it=128,  # Unser Trichter-Limit
+                samples_per_it=num_samples  # Gesamtes Sample-Budget
+            )
 
-                # Indices zurück in X und Y Koordinaten (0.0 bis 1.0) umrechnen
-                pos_y = (sampled_indices // self.resolution).float() / self.resolution
-                pos_x = (sampled_indices % self.resolution).float() / self.resolution
-
-                # Zu (N, 2) Tensor stacken
-                random_samples = torch.stack((pos_x, pos_y), dim=1)
+            # WICHTIG: Fallback, falls mal wirklich nichts zurückkommt
+            if final_samples_tensor is None:
+                continue
 
             best_params, best_color, best_score = None, None, None
             elite_tensor = OptimizerEngine.find_best_shape(
                 target_img=self.target_img,
                 canvas_img=self.canvas_img,
-                random_samples=random_samples,
+                random_samples=final_samples_tensor,
                 target_alpha=self.target_alpha,
                 n_mutate=cfg["n_mutate"],
                 min_size=min_size_t,
@@ -247,7 +456,9 @@ class VectorRenderer:
                 patch_fov_px=patch_fov_px_t,
                 top_k=cfg["top_k"],
                 resolution=self.resolution,
-                alpha_base=min(current_max_s, 0.5)
+                alpha_base=min(current_max_s, 0.5),
+                gpu_package=gpu_package,
+
             )
             elite_shapes = elite_tensor.detach().cpu().numpy()
 
@@ -493,10 +704,10 @@ if __name__ == "__main__":
     preset=RenderPreset.FAST
     renderer.render(
         preset=preset,
-        preview_interval=100,
-        total_shapes_target=500,
+        preview_interval=50,
+        total_shapes_target=3000,
         telemetry=False,
-        wait_at_finisch=False,
+        wait_at_finisch=True,
         max_shapes_per_iteration = preset.value["max_shapes_per_iteration"],
     )
     time_end = time.time()

@@ -17,10 +17,8 @@ class OptimizerEngine:
     Modul 3: Das Herzstück. Sucht, filtert und optimiert Formen im Round-Robin-Verfahren.
     Beherrscht den "smart" (Adam) und "dumb" (Evolutionär) Mode.
 
-
     Master Tensor:
     Geometrie & Alpha (0-6):
-
     0: cx (Center X)
     1: cy (Center Y)
     2: w (Width)
@@ -30,14 +28,17 @@ class OptimizerEngine:
     6: alpha (Deckkraft)
 
 Farbe (7-9):
-
     7: r, 8: g, 9: b
 
 Typ & Meta (10-11):
-
-
     10: score (Loss-Wert)
     11: s_type (0=Ellipse, 1=Rechteck, 2=Dreieck)
+
+
+    @:param random_samples tensor mit (N,5)
+            0,1 x,y
+            2 bucketID
+            3, 4 bucketCenter
     """
 
     @staticmethod
@@ -48,23 +49,30 @@ Typ & Meta (10-11):
                         min_size: Tensor,
                         max_size: Tensor,
                         patch_fov_px: Tensor,
+                        gpu_package:Tensor,
                         top_k: int = 64,
                         n_mutate: int = 40,
                         tile_size: int = 112,
                         chunk_size: int = 512,
                         resolution=1024,
-                        alpha_base=0.5) -> Tensor:
+                        alpha_base=0.5,
+                        ) -> Tensor:
 
         with torch.no_grad():
             device = target_img.device
             # ==========================================
-            # PHASE 1: Init Shapes and score
+            # PHASE 1: Shotgun Init
             # ==========================================
 
             N = random_samples.shape[0]
             master_tensor = torch.zeros((N, 12), device=device)
             master_tensor[:, CX:CY+1] = random_samples[:, 0:2]  #Position x,y
 
+            bucket_ids = random_samples[:, 2]
+            bucket_centers = random_samples[:, 3:5]
+
+            # Spalten: 5=xmin, 6=xmax, 7=ymin, 8=ymax
+            bucket_bounds = random_samples[:, 5:9]
 
             master_tensor[:, W:W+1] = torch.rand((N, 1), device=device) * (max_size[0, 0] - min_size[0, 0]) + min_size[0, 0]  # width
             master_tensor[:, H:H+1] = torch.rand((N, 1), device=device) * (max_size[0, 1] - min_size[0, 1]) + min_size[0, 1]  # height
@@ -75,27 +83,118 @@ Typ & Meta (10-11):
             master_tensor[:, STYPE:STYPE+1] = torch.floor(torch.rand((N, 1), device=device) * 3.0)  # shape 6
 
 
-            for i in range(0, N, chunk_size):
 
-                T_target, T_canvas, T_alpha, local_grids = OptimizerEngine._extract_tiles(
-                    master_tensor[i: i + chunk_size], target_img, canvas_img, target_alpha, tile_size, patch_fov_px
-                )
-
-                master_tensor[i: i + chunk_size,R:SCORE+1] = OptimizerEngine.shotgun_score_color(
-                    master_tensor[i: i + chunk_size],min_size,max_size, T_target, T_canvas, T_alpha, local_grids
-                )
 
             # ==========================================
-            # PHASE 2: DER FILTER (Top-K)
+            # PHASE 1 & 2 MERGED: Ein Tile pro Bucket!
             # ==========================================
+            unique_buckets, inverse_indices = torch.unique(bucket_ids, return_inverse=True)
+            num_unique = unique_buckets.shape[0]
 
-            _, best_indices = torch.topk(master_tensor[:, SCORE], top_k, largest=False)
-            elites = master_tensor[best_indices]
+            elites_list = []
+            bounds_list = []
+            centers_list = []
 
+            # 1. Wir holen uns die Zentren für JEDES eindeutige Bucket genau einmal
+            # Da die Daten sortiert sind, reicht es, wenn wir das Zentrum des jeweils ersten Samples nehmen
+            first_occurrence_indices = torch.zeros(num_unique, dtype=torch.long, device=device)
+            first_occurrence_indices.scatter_(0, inverse_indices, torch.arange(N, device=device))
+            unique_centers = bucket_centers[first_occurrence_indices]
+            unique_bounds = bucket_bounds[first_occurrence_indices]
+
+            # 2. Wir schneiden exakt B Tiles aus (z.B. max 128 Stück auf einmal!)
+            # Das ist EIN einziger blitzschneller Aufruf für das gesamte Bild.
+            T_target_B, T_canvas_B, T_alpha_B, local_grids_B = OptimizerEngine._extract_tiles(
+                master_tensor[:num_unique], target_img, canvas_img, target_alpha, tile_size, patch_fov_px,
+                bucket_centers=unique_centers
+            )
+
+            T_target_B = T_target_B.clone()
+            T_canvas_B = T_canvas_B.clone()
+            T_alpha_B = T_alpha_B.clone()
+            local_grids_B = local_grids_B.clone()
+
+            # ==========================================
+            # DER ULTIMATIVE MERGE: 100% VEKTORISIERT
+            # ==========================================
+            # 3. Wir weisen die B Kacheln mit inverse_indices allen N Samples zu
+            # (Das ist ein einziger Vektor-Befehl, keine for-Schleife!)
+            T_target_N = T_target_B[inverse_indices]
+            T_canvas_N = T_canvas_B[inverse_indices]
+            T_alpha_N = T_alpha_B[inverse_indices]
+            local_grids_N = local_grids_B[inverse_indices]
+
+            # 4. EIN EINZIGER GPU AUFRUF für alle (z.B. 2048) Samples!
+            scored_shapes = OptimizerEngine.shotgun_score_color(
+                master_tensor, min_size, max_size, T_target_N, T_canvas_N, T_alpha_N, local_grids_N
+            )
+            master_tensor[:, R:SCORE + 1] = scored_shapes
+
+            # 5. Gewinner pro Bucket finden (Einziger winziger CPU-Loop)
+            elites_list = []
+
+            for i in range(num_unique):
+                # inverse_indices ist bereits 0 bis num_unique-1
+                mask = (inverse_indices == i)
+                bucket_shapes = master_tensor[mask]
+
+                best_idx = torch.argmin(bucket_shapes[:, SCORE])
+                elites_list.append(bucket_shapes[best_idx])
+
+            # 6. Wieder zusammenbauen
+            elites = torch.stack(elites_list)
+
+            # WICHTIG: Da elites_list exakt in der Reihenfolge von unique_buckets
+            # aufgebaut wurde, können wir die unique-Tensoren direkt übernehmen!
+            elite_bounds = unique_bounds
+            elite_centers = unique_centers
+
+            # --- Top-K Reduktion für Phase 3 (VRAM Schutz) ---
+            if elites.shape[0] > top_k:
+                _, global_best_indices = torch.topk(elites[:, SCORE], top_k, largest=False)
+                elites = elites[global_best_indices]
+                elite_bounds = elite_bounds[global_best_indices]
+                elite_centers = elite_centers[global_best_indices]
+
+
+            # ==========================================
+            # SORTING & PADDING (Der VRAM & Compile Schutz)
+            # ==========================================
+            current_count = elites.shape[0]
+
+            # 1. IMMER global nach Score sortieren (Bester oben)
+            _, sorted_idx = torch.sort(elites[:, SCORE])
+            elites = elites[sorted_idx]
+            elite_bounds = elite_bounds[sorted_idx]
+            elite_centers = elite_centers[sorted_idx]
+
+            # 2. Wenn wir zu viele haben -> Abschneiden
+            if current_count > top_k:
+                elites = elites[:top_k]
+                elite_bounds = elite_bounds[:top_k]
+                elite_centers = elite_centers[:top_k]
+
+            # 3. Wenn wir zu wenige haben -> Mit den Besten auffüllen (Padding!)
+            elif current_count < top_k:
+                padding_needed = top_k - current_count
+
+                # Wir nehmen die Indizes von vorne (die Besten) und fangen wieder
+                # bei 0 an, falls wir mehr Padding brauchen als wir Elemente haben.
+                pad_indices = torch.arange(padding_needed, device=device) % current_count
+
+                # Klone einfach unten drankleben
+                elites = torch.cat([elites, elites[pad_indices]], dim=0)
+                elite_bounds = torch.cat([elite_bounds, elite_bounds[pad_indices]], dim=0)
+                elite_centers = torch.cat([elite_centers, elite_centers[pad_indices]], dim=0)
 
             T_target_k, T_canvas_k, T_alpha_k, local_grids_k = OptimizerEngine._extract_tiles(
-                elites, target_img, canvas_img, target_alpha, tile_size,patch_fov_px
+                elites, target_img, canvas_img, target_alpha, tile_size, patch_fov_px, bucket_centers=elite_centers
             )
+
+            T_target_k = T_target_k.clone()
+            T_canvas_k = T_canvas_k.clone()
+            T_alpha_k = T_alpha_k.clone()
+            local_grids_k = local_grids_k.clone()
 
             # ------------------------------------------
             # PHASE 3: Evolutionäre Mutation
@@ -121,7 +220,8 @@ Typ & Meta (10-11):
                     T_target_k=T_target_k,
                     T_canvas_k=T_canvas_k,
                     T_alpha_k=T_alpha_k,
-                    local_grids_k=local_grids_k
+                    local_grids_k=local_grids_k,
+                    bounds=elite_bounds,
                 ).clone()
 
 
@@ -159,18 +259,17 @@ Typ & Meta (10-11):
         return torch.cat([colors, scores.unsqueeze(1)], dim=1)
 
     @staticmethod
-    @torch.compile(fullgraph=True)
-    def _extract_tiles(shapes: torch.Tensor, target_img, canvas_img, target_alpha, tile_size,patch_fov_px):
+    @torch.compile(fullgraph=True, mode="reduce-overhead")
+    def _extract_tiles(shapes: torch.Tensor, target_img, canvas_img,
+                       target_alpha, tile_size,patch_fov_px,
+                       bucket_centers):
         B = shapes.shape[0]
         H, W = target_img.shape[1], target_img.shape[2]
         device = shapes.device
 
-        cx = shapes[:, CX]
-        cy = shapes[:, CY]
-
         # grid_sample erwartet Koordinaten von -1.0 bis +1.0
-        tx = cx * 2.0 - 1.0
-        ty = cy * 2.0 - 1.0
+        tx = bucket_centers[:, 0]
+        ty = bucket_centers[:, 1]
 
         # 1. Das Sichtfeld (FOV): Wie viel Prozent des Bildes schneiden wir aus?
         scale = patch_fov_px[0] / H
@@ -202,7 +301,8 @@ Typ & Meta (10-11):
     def _evolution_step(elites: torch.Tensor, progress: torch.Tensor, resolution: int,
                         min_size: Tensor, max_size: Tensor,
                         T_target_k: torch.Tensor, T_canvas_k: torch.Tensor,
-                        T_alpha_k: torch.Tensor, local_grids_k: torch.Tensor) -> torch.Tensor:
+                        T_alpha_k: torch.Tensor, local_grids_k: torch.Tensor,
+                        bounds:Tensor) -> torch.Tensor:
 
         n_elites = elites.shape[0]
         n_mutants = 32  # Eventuell als Parameter nach oben ziehen
@@ -223,7 +323,13 @@ Typ & Meta (10-11):
         # 4. Rauschen erzeugen und anwenden
         noise = torch.rand((n_elites * n_mutants, 7), device=elites.device) * 2.0 - 1.0
 
-        cx_cy = (base_geom[:, CX:CY + 1] + noise[:, 0:2] * shift_amplitude).clamp(0.0, 1.0)
+        raw_cx_cy = base_geom[:, CX:CY + 1] + noise[:, 0:2] * shift_amplitude
+        exp_bounds = bounds.unsqueeze(1).expand(n_elites, n_mutants, 4).reshape(-1, 4)
+        # ... und sofort ins Gefängnis gesperrt (bounds[:, 0] ist xmin, bounds[:, 1] ist xmax etc.)
+        cx = torch.clamp(raw_cx_cy[:, 0], min=exp_bounds[:, 0], max=exp_bounds[:, 1])
+        cy = torch.clamp(raw_cx_cy[:, 1], min=exp_bounds[:, 2], max=exp_bounds[:, 3])
+        cx_cy = torch.stack([cx, cy], dim=1)
+
         rw_rh = torch.minimum(torch.maximum(base_geom[:, W:H + 1] + noise[:, 2:4] * scale_amplitude, min_size),
                               max_size)
         angle = base_geom[:, ROT:ROT + 1] + noise[:, 4:5] * rot_amplitude
@@ -266,13 +372,12 @@ Typ & Meta (10-11):
         # Wir bauen kurz einen Dummy-(K*M, 12)-Tensor für die Loss-Funktion,
         # falls compute_score auf bestimmte Spalten zugreifen muss!
         dummy_scores = torch.zeros((total_m, 1), device=elites.device)
-        mutant_master = torch.cat([mutant_geom, mutant_colors, dummy_scores, base_stype], dim=1)
 
         mutant_scores = GPUColorAndLoss.compute_score(blended, T_target_m, T_alpha_m, T_canvas_m, masks, mutant_alphas
                                                       )
 
-        # Echte Scores in Spalte 10 nachtragen
-        mutant_master[:, SCORE] = mutant_scores
+
+        mutant_master = torch.cat([mutant_geom, mutant_colors, mutant_scores.unsqueeze(1), base_stype], dim=1)
 
         # =================================================================
         # 8. DER ELITISMUS-POOL (Jeder Vater tritt gegen seine 32 Kinder an)
