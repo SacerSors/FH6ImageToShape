@@ -59,7 +59,7 @@ if __name__ == "__main__":
     IMAGE_PATH = "bilder/frierenHeart.jpg"
     evaluator = ImageEvaluator()
     #lpips_val, mse_val = evaluator.evaluate(args.original, args.render, args.res)
-    lpips_score, mse_score = evaluator.evaluate(IMAGE_PATH, "frierenHeart_vektor_bucketBased.png", 1024)
+    lpips_score, mse_score = evaluator.evaluate(IMAGE_PATH, "frierenHeart_vektor_UltraFast.png", 512)
 
 
     print("\n" + "=" * 40)
@@ -70,3 +70,27 @@ if __name__ == "__main__":
     print(f"LPIPS Score: {lpips_score:.5f}  (Kleiner = Besser)")
     print(f"MSE Score:   {mse_score:.5f}  (Kleiner = Besser)")
     print("=" * 40 + "\n")
+
+    """
+    normal
+
+    LPIPS Score: 0.35026  (Kleiner = Besser)
+
+    MSE Score:   0.01753  (Kleiner = Besser)
+
+    
+
+    multishape
+
+    LPIPS Score: 0.33303  (Kleiner = Besser)
+
+    MSE Score:   0.01598  (Kleiner = Besser
+
+    
+
+    bucketBased
+
+    LPIPS Score: 0.36045  (Kleiner = Besser)
+
+    MSE Score:   0.01856  (Kleiner = Besser) 
+    """

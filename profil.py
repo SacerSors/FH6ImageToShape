@@ -92,3 +92,19 @@ class RenderPreset(Enum):
         "batch_multi": 3,
         "resolution": 4096
     }
+
+    # --- LEVEL 2: FAST ---
+    # Bereits nutzbar, neigt aber zu leichten Flecken/Mängeln
+    SMALL = {
+        "patience_factor": 0.70,
+        "MAX_BAD_SCORES": 30,
+        "ema_positiv_reaction": 0.15,
+        "ema_negativ_reaction": 0.01,
+        "pinsel_steilheit": 0.70,      # Mehr Freiheit nach oben im Mittelbau
+        "n_mutate": 64,
+        "top_k": 48,
+        "sample_multi": 8,
+        "batch_multi": 4,
+        "resolution": 512,
+        "max_shapes_per_iteration":16
+    }

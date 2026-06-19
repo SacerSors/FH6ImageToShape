@@ -148,14 +148,7 @@ Typ & Meta (10-11):
             # aufgebaut wurde, können wir die unique-Tensoren direkt übernehmen!
             elite_bounds = unique_bounds
             elite_centers = unique_centers
-
-            # --- Top-K Reduktion für Phase 3 (VRAM Schutz) ---
-            if elites.shape[0] > top_k:
-                _, global_best_indices = torch.topk(elites[:, SCORE], top_k, largest=False)
-                elites = elites[global_best_indices]
-                elite_bounds = elite_bounds[global_best_indices]
-                elite_centers = elite_centers[global_best_indices]
-
+            elite_bucket_ids = unique_buckets
 
             # ==========================================
             # SORTING & PADDING (Der VRAM & Compile Schutz)
@@ -173,6 +166,7 @@ Typ & Meta (10-11):
                 elites = elites[:top_k]
                 elite_bounds = elite_bounds[:top_k]
                 elite_centers = elite_centers[:top_k]
+                elite_bucket_ids = elite_bucket_ids[:top_k]
 
             # 3. Wenn wir zu wenige haben -> Mit den Besten auffüllen (Padding!)
             elif current_count < top_k:
@@ -186,6 +180,7 @@ Typ & Meta (10-11):
                 elites = torch.cat([elites, elites[pad_indices]], dim=0)
                 elite_bounds = torch.cat([elite_bounds, elite_bounds[pad_indices]], dim=0)
                 elite_centers = torch.cat([elite_centers, elite_centers[pad_indices]], dim=0)
+                elite_bucket_ids = torch.cat([elite_bucket_ids, elite_bucket_ids[pad_indices]], dim=0)
 
             T_target_k, T_canvas_k, T_alpha_k, local_grids_k = OptimizerEngine._extract_tiles(
                 elites, target_img, canvas_img, target_alpha, tile_size, patch_fov_px, bucket_centers=elite_centers
@@ -224,9 +219,7 @@ Typ & Meta (10-11):
                     bounds=elite_bounds,
                 ).clone()
 
-
-
-
+            elites = torch.cat([elites, elite_bucket_ids.unsqueeze(1)], dim=1)
             return elites
 
     @staticmethod

@@ -129,6 +129,8 @@ class VectorRenderer:
                     "gpu_tx": tx,  # Perfekt vorbereitet für die GPU!
                     "gpu_ty": ty,  # Perfekt vorbereitet für die GPU!
                     "shape_count": 0,
+                    "failed_attempts": 0,  # NEU: Strike-Zähler
+                    "locked_until_brush": 0.0,  # NEU: Sperr-Grenze
 
                 })
                 bucket_id += 1
@@ -153,35 +155,49 @@ class VectorRenderer:
     
     """
 
-    def _generate_samples_from_buckets(self, bucket_tiers: dict, buckets_per_it:int, samples_per_it:int):
+    def _generate_samples_from_buckets(self,current_max_s, bucket_tiers: dict, buckets_per_it:int, samples_per_it:int):
         if bucket_tiers is None:
             bucket_tiers = {"normal": range(len(self.active_grid))}
 
-        high_buckets = bucket_tiers.get("high", [])
-        normal_buckets = bucket_tiers.get("normal", [])
-        low_buckets = bucket_tiers.get("low", [])
+        valid_high, valid_normal, valid_low = [], [], []
+
+        for b_id, b in enumerate(self.active_grid):
+            # Sperre prüfen
+            if b["locked_until_brush"] > 0 and current_max_s >= b["locked_until_brush"]: continue
+            # Soft-Cap prüfen (max 15 Shapes pro LOD-Stufe)
+            if b["shape_count"] >= 15: continue
+
+            # Sortieren (Dummy-Logik, solange LPIPS-Heatmap fehlt)
+            if bucket_tiers and b_id in bucket_tiers.get("high", []):
+                valid_high.append(b_id)
+            elif bucket_tiers and b_id in bucket_tiers.get("low", []):
+                valid_low.append(b_id)
+            else:
+                valid_normal.append(b_id)
 
         target_high = buckets_per_it //2
         target_normal = buckets_per_it //4
         target_low = buckets_per_it //4
 
         # HIGH auswerten & Überlauf berechnen
-        high_count = min(target_high, len(high_buckets))
+        high_count = min(target_high, len(valid_high))
         leftover_high = target_high - high_count
 
         # NORMAL auswerten (Bekommt den Rest von HIGH)
         target_normal += leftover_high
-        normal_count = min(target_normal, len(normal_buckets))
+        normal_count = min(target_normal, len(valid_normal))
         leftover_normal = target_normal - normal_count
 
         # LOW auswerten (Bekommt den Rest von NORMAL)
         target_low += leftover_normal
-        low_count = min(target_low, len(low_buckets))
+        low_count = min(target_low, len(valid_low))
 
         # 2. Buckets zufällig ziehen
-        selected_high = random.sample(high_buckets, high_count)
-        selected_normal = random.sample(normal_buckets, normal_count)
-        selected_low = random.sample(low_buckets, low_count)
+        blocked_set = set()
+
+        selected_high = self._smart_sample(valid_high, high_count, blocked_set)
+        selected_normal = self._smart_sample(valid_normal, normal_count, blocked_set)
+        selected_low = self._smart_sample(valid_low, low_count, blocked_set)
 
         # 3. Wir nutzen eine lokale Liste statt self.all_samples (sauberer)
         all_samples_tensors = []
@@ -250,6 +266,32 @@ class VectorRenderer:
         bucket_tensor = torch.stack((rand_x, rand_y, b_id_t, tx_t, ty_t, t_xmin, t_xmax, t_ymin, t_ymax), dim=1)
 
         return [bucket_tensor]
+
+    def _smart_sample(self, pool: list[int], target_count: int, blocked_set: set):
+        if not pool: return []
+        random.shuffle(pool)
+        selected = []
+        stride = self.active_core_size // 2
+
+        # 1. Versuch: Räumlich getrennt (Spatial NMS)
+        for b_id in pool:
+            b = self.active_grid[b_id]
+            gx, gy = b["core_x_start"] // stride, b["core_y_start"] // stride
+            if (gx, gy) in blocked_set: continue
+
+            selected.append(b_id)
+            # Blockiere das 3x3 Umfeld
+            for dy in [-1, 0, 1]:
+                for dx in [-1, 0, 1]: blocked_set.add((gx + dx, gy + dy))
+            if len(selected) >= target_count: break
+
+        # 2. Fallback: Wenn wir das Target durch Blockaden nicht erreicht haben, fülle blind auf!
+        if len(selected) < target_count:
+            remaining_pool = [b for b in pool if b not in selected]
+            needed = target_count - len(selected)
+            selected.extend(random.sample(remaining_pool, min(needed, len(remaining_pool))))
+
+        return selected
 
     def calculate_attention(self, total_objects, total_attention):
         # 1. Objekte auf Tiers verteilen (50%, 25%, 25%)
@@ -435,7 +477,8 @@ class VectorRenderer:
             final_samples_tensor, gpu_package = self._generate_samples_from_buckets(
                 bucket_tiers=None,
                 buckets_per_it=128,  # Unser Trichter-Limit
-                samples_per_it=num_samples  # Gesamtes Sample-Budget
+                samples_per_it=num_samples,  # Gesamtes Sample-Budget
+                current_max_s=current_max_s,
             )
 
             # WICHTIG: Fallback, falls mal wirklich nichts zurückkommt
@@ -462,6 +505,7 @@ class VectorRenderer:
             )
             elite_shapes = elite_tensor.detach().cpu().numpy()
 
+
             # ====================================================================
             # DYNAMISCHES LIMIT (EMA-Filter)
             # ====================================================================
@@ -478,10 +522,12 @@ class VectorRenderer:
                                              overlap_margin=0.95
                                              )
 
+            # ====================================================================
+            # BUCKET REWARD & PUNISHMENT
+            # ====================================================================
+            queried_buckets = torch.unique(final_samples_tensor[:, 2]).cpu().numpy().astype(int).tolist()
+            accepted_ids = [int(shape_data[12]) for shape_data in final_shapes] if len(final_shapes) > 0 else []
 
-            # ====================================================================
-            # FILTER (REJECTION SAMPLING)
-            # ====================================================================
             if len(final_shapes) == 0:
                 consecutive_bad_scores += 1
                 bad_shapes_count+=1
@@ -498,11 +544,30 @@ class VectorRenderer:
                 continue  #Form wegwerfen
 
             # ====================================================================
+            # FILTER (REJECTION SAMPLING)
+            # ====================================================================
+            if len(final_shapes) == 0:
+                consecutive_bad_scores += 1
+                bad_shapes_count += 1
+                best_rejected_candidate = elite_shapes[0, 10].item()
+
+                if best_rejected_candidate < best_rejected_score:
+                    best_rejected_score = best_rejected_candidate
+
+                if consecutive_bad_scores > MAX_BAD_SCORES:
+                    if ema_score is not None:
+                        ema_score = best_rejected_score
+                    consecutive_bad_scores = 0
+                    best_rejected_score = float('inf')  # speicher für lokales maximum zurücksetzen
+                continue  # Form wegwerfen
+
+            # ====================================================================
             # Erfolg - Filter Anpassen
             # ====================================================================
             consecutive_bad_scores = math.ceil(consecutive_bad_scores / 2)
             best_rejected_score = float('inf')  # speicher für lokales maximum zurücksetzen
             mean_batch_score = None
+
             for shape_data in final_shapes:
 
 
@@ -701,13 +766,13 @@ if __name__ == "__main__":
 
     # 10er Intervalle für das Live-Fenster sind angenehm flüssig
     time_start = time.time()
-    preset=RenderPreset.FAST
+    preset=RenderPreset.SMALL
     renderer.render(
         preset=preset,
-        preview_interval=50,
+        preview_interval=100,
         total_shapes_target=3000,
         telemetry=False,
-        wait_at_finisch=True,
+        wait_at_finisch=False,
         max_shapes_per_iteration = preset.value["max_shapes_per_iteration"],
     )
     time_end = time.time()
